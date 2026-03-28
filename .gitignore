@@ -42,7 +42,7 @@
 *.idb
 *.pdb
 
-# Kernel Module Compile Results
+# Kernel Module Compile Results (Linux)
 *.mod*
 *.cmd
 .tmp_versions/
@@ -51,5 +51,26 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
+# FreeBSD Kernel Module Build
+.depend
+.depend.*
+export_syms
+machine
+x86
+i386
+opt_*.h
+*.symbols
+
 # debug information files
 *.dwo
+
+# Core dumps
+*.core
+
+# Test binaries
+tests/test_add_self
+tests/test_add
+tests/test_remove
+tests/test_clear
+tests/test_exec
+tests/test_fork
