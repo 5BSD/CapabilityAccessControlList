@@ -4,26 +4,89 @@ A FreeBSD kernel module that controls which processes can use specific file
 descriptors. CACL extends the capability model by allowing fine-grained,
 per-descriptor access control based on process identity.
 
-## Overview
+## The Problem
 
-CACL solves a specific problem: when you pass a file descriptor to another
-process (via fork, exec, or fd passing), you lose control over who can use it.
-CACL lets you maintain an access list on the descriptor itself.
+In Unix, **possession of a file descriptor grants the ability to use it**.
+This creates two problems:
+
+### 1. Uncontrolled Propagation
+
+Once you give a descriptor to another process, they can pass it to anyone:
 
 ```
-┌─────────────┐     fork/exec      ┌─────────────┐
-│   Parent    │ ──────────────────>│   Child     │
-│  (allowed)  │                    │  (denied)   │
-└──────┬──────┘                    └──────┬──────┘
-       │                                  │
-       │ write() ✓                        │ write() ✗ EACCES
-       │                                  │
-       v                                  v
-   ┌───────────────────────────────────────────┐
-   │              Pipe/Socket                  │
-   │         ACL: [parent_token]               │
-   └───────────────────────────────────────────┘
+You create a pipe, give it to Process A (trusted)
+                │
+                ▼
+        Process A passes it to Process B via SCM_RIGHTS
+                │
+                ▼
+        Process B passes it to Process C
+                │
+                ▼
+        You have no way to prevent this
 ```
+
+### 2. Exec Changes the Program, Not the Access
+
+When a process exec's a new program, it keeps its file descriptors. A
+descriptor you intended for one program is now available to a completely
+different program:
+
+```
+You fork a child, give it an fd for communication
+                │
+                ▼
+        Child exec's "trusted_helper" - works as intended
+                │
+                ▼
+        But what if child exec's "malicious_program" instead?
+                │
+                ▼
+        malicious_program has full access to your fd
+```
+
+### What About Capsicum?
+
+Capsicum capabilities let you restrict *what operations* a descriptor allows
+(read-only, no seek, etc.), but they don't control *who* can use it:
+
+- A capability-restricted fd can still be passed to other processes
+- A capability-restricted fd survives exec into a different program
+- The recipient has whatever rights the capability allows
+
+**Capsicum controls what you can do. CACL controls who can do it.**
+
+## The Solution
+
+CACL makes access depend on **process identity**, not just possession.
+Each descriptor has an access control list. Only processes whose token is
+in the ACL can use it.
+
+**Two key behaviors:**
+
+1. **Propagation is useless**: If Process A passes an fd to Process B,
+   and B is not in the ACL, B gets EACCES on any operation.
+
+2. **Exec invalidates access**: When a process calls exec(), it gets a new
+   token. If the new token isn't in the ACL, the descriptor becomes unusable.
+
+```
+Descriptor with ACL: [token_A, token_B]
+
+Process A (token_A) ──► Can use it ✓
+        │
+        │ passes fd to Process C
+        ▼
+Process C (token_C) ──► EACCES ✗ (not in ACL)
+
+Process B (token_B) ──► Can use it ✓
+        │
+        │ calls exec("new_program")
+        ▼
+Process B (token_X) ──► EACCES ✗ (new token after exec)
+```
+
+**The descriptor is bound to specific process images, not just possession.**
 
 ## Quick Start
 
@@ -79,7 +142,25 @@ int main() {
 
 ## Use Cases
 
-### 1. Protecting IPC Channels After Exec
+### 1. Preventing Unauthorized FD Passing
+
+You give a socket to a worker, but don't want the worker to share it:
+
+```c
+int sv[2];
+socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+
+/* Only allow yourself and the worker */
+cacl_add_self(cacl_fd, &sv[0], 1);
+cacl_add(cacl_fd, &sv[0], 1, &worker_proc_fd, 1);
+
+/* Send sv[0] to worker via SCM_RIGHTS - worker can use it */
+
+/* If worker sends sv[0] to another process... */
+/* ...that process gets EACCES when trying to use it */
+```
+
+### 2. Protecting IPC Channels After Exec
 
 Prevent exec'd helper programs from accessing parent's communication channels:
 
@@ -101,7 +182,7 @@ if (pid == 0) {
 /* Child's stdin/stdout, but not sv[0] */
 ```
 
-### 2. Controlled Delegation with Process Descriptors
+### 3. Controlled Delegation with Process Descriptors
 
 Grant specific child processes access using pdfork():
 
@@ -129,7 +210,7 @@ ioctl(cacl_fd, CACL_IOC_ADD, &cm);
 /* Other processes still denied */
 ```
 
-### 3. Revoking Access
+### 4. Revoking Access
 
 Remove access when no longer needed:
 
@@ -145,7 +226,7 @@ cacl_remove(cacl_fd, &pipe_w, 1, &proc_fd, 1);
 /* Child's next write() returns EACCES */
 ```
 
-### 4. Batch Operations
+### 5. Batch Operations
 
 Add multiple processes to multiple descriptors in one call:
 
