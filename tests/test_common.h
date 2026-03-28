@@ -141,6 +141,38 @@ cacl_clear(int cacl_fd, int *cap_fds, int cap_count)
 }
 
 /*
+ * Helper to lock a capability's access list (deny-all mode).
+ */
+static inline int
+cacl_lock(int cacl_fd, int *cap_fds, int cap_count)
+{
+	struct cacl_fds cf;
+
+	cf.cf_cap_fds = cap_fds;
+	cf.cf_cap_count = cap_count;
+	return (ioctl(cacl_fd, CACL_IOC_LOCK, &cf));
+}
+
+/*
+ * Helper to query if a process is in a capability's access list.
+ * Returns 0 on success, with result in *is_member (1=yes, 0=no).
+ */
+static inline int
+cacl_query(int cacl_fd, int cap_fd, int proc_fd, int *is_member)
+{
+	struct cacl_query cq;
+	int ret;
+
+	cq.cq_cap_fd = cap_fd;
+	cq.cq_proc_fd = proc_fd;
+	cq.cq_result = 0;
+	ret = ioctl(cacl_fd, CACL_IOC_QUERY, &cq);
+	if (ret == 0 && is_member != NULL)
+		*is_member = cq.cq_result;
+	return (ret);
+}
+
+/*
  * Create a pipe and return both ends.
  */
 static inline int

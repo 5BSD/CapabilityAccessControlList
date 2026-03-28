@@ -94,5 +94,6 @@ tests/test_ioctl
 tests/test_threads
 tests/test_edge
 tests/test_comprehensive
+tests/test_lock_query
 tests/test_helper
 tests/test_sem

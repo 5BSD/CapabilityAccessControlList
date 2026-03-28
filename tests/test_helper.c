@@ -12,6 +12,7 @@
  *   fstat     - try to fstat fd
  *   recv      - try to recv from socket fd
  *   ftruncate - try to ftruncate fd (shm)
+ *   wait      - just wait on sync_fd and exit 0 (for token differentiation tests)
  *
  * If sync_fd is provided, waits for a byte on it before proceeding.
  *
@@ -156,6 +157,8 @@ main(int argc, char *argv[])
 		return (try_recv(fd));
 	else if (strcmp(op, "ftruncate") == 0)
 		return (try_ftruncate(fd));
+	else if (strcmp(op, "wait") == 0)
+		return (0);  /* Just exit success - used for token tests. */
 	else {
 		fprintf(stderr, "unknown operation: %s\n", op);
 		return (12);

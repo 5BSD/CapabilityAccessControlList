@@ -226,7 +226,41 @@ cacl_remove(cacl_fd, &pipe_w, 1, &proc_fd, 1);
 /* Child's next write() returns EACCES */
 ```
 
-### 5. Batch Operations
+### 5. Deny-All Mode (Locking)
+
+Temporarily or permanently disable all access to a descriptor:
+
+```c
+/* Lock the descriptor - nobody can use it */
+cacl_lock(cacl_fd, &pipe_w, 1);
+
+/* Now even the owner can't use it */
+write(pipe_w, "x", 1);  /* EACCES */
+
+/* Re-enable for yourself */
+cacl_add_self(cacl_fd, &pipe_w, 1);
+
+/* Now you can use it again */
+write(pipe_w, "x", 1);  /* Success */
+```
+
+### 6. Querying Membership
+
+Check if a process is in the ACL before deciding what to do:
+
+```c
+int is_member;
+cacl_query(cacl_fd, pipe_w, child_proc_fd, &is_member);
+
+if (is_member) {
+    printf("Child already has access\n");
+} else {
+    printf("Child not in ACL, adding...\n");
+    cacl_add(cacl_fd, &pipe_w, 1, &child_proc_fd, 1);
+}
+```
+
+### 7. Batch Operations
 
 Add multiple processes to multiple descriptors in one call:
 
@@ -262,6 +296,8 @@ int cacl_fd = open("/dev/cacl", O_RDWR);
 | `CACL_IOC_ADD` | Add processes (by procdesc) to ACLs | `struct cacl_members` |
 | `CACL_IOC_REMOVE` | Remove processes from ACLs | `struct cacl_members` |
 | `CACL_IOC_CLEAR` | Clear ACLs (return to default-allow) | `struct cacl_fds` |
+| `CACL_IOC_LOCK` | Lock ACLs (deny-all mode) | `struct cacl_fds` |
+| `CACL_IOC_QUERY` | Check if process is in ACL | `struct cacl_query` |
 
 ### Structures
 
@@ -276,6 +312,12 @@ struct cacl_members {
     uint16_t  cm_cap_count;  /* Number of descriptors */
     int      *cm_proc_fds;   /* Array of process descriptor fds */
     uint16_t  cm_proc_count; /* Number of processes */
+};
+
+struct cacl_query {
+    int  cq_cap_fd;    /* Descriptor to check */
+    int  cq_proc_fd;   /* Process descriptor to check */
+    int  cq_result;    /* Output: 1 if member, 0 if not */
 };
 ```
 

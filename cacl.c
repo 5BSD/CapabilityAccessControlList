@@ -92,6 +92,7 @@ struct cacl_acl {
 	uint64_t	*al_tokens;	/* array of allowed tokens      */
 	uint32_t	 al_count;	/* number of tokens in list     */
 	uint32_t	 al_capacity;	/* allocated capacity           */
+	int		 al_locked;	/* if set, empty list = deny-all */
 };
 
 /*
@@ -119,6 +120,8 @@ static void	cacl_acl_destroy(struct cacl_acl *acl);
 static int	cacl_acl_add(struct cacl_acl *acl, uint64_t token);
 static int	cacl_acl_remove(struct cacl_acl *acl, uint64_t token);
 static void	cacl_acl_clear(struct cacl_acl *acl);
+static void	cacl_acl_lock(struct cacl_acl *acl);
+static int	cacl_acl_contains(struct cacl_acl *acl, uint64_t token);
 static int	cacl_acl_check(struct cacl_acl *acl, uint64_t token,
 		    const char *op);
 static uint64_t	cacl_new_token(void);
@@ -135,6 +138,7 @@ cacl_acl_init(struct cacl_acl *acl)
 	acl->al_tokens = NULL;
 	acl->al_count = 0;
 	acl->al_capacity = 0;
+	acl->al_locked = 0;
 }
 
 static void
@@ -212,7 +216,7 @@ cacl_acl_remove(struct cacl_acl *acl, uint64_t token)
 }
 
 /*
- * Clear all tokens from the access list.
+ * Clear all tokens from the access list and return to default-allow.
  * Caller must hold al_lock exclusively.
  */
 static void
@@ -221,13 +225,45 @@ cacl_acl_clear(struct cacl_acl *acl)
 
 	sx_assert(&acl->al_lock, SX_XLOCKED);
 	acl->al_count = 0;
+	acl->al_locked = 0;
+}
+
+/*
+ * Lock the access list: clear all tokens and set deny-all mode.
+ * Even an empty list will deny access when locked.
+ * Caller must hold al_lock exclusively.
+ */
+static void
+cacl_acl_lock(struct cacl_acl *acl)
+{
+
+	sx_assert(&acl->al_lock, SX_XLOCKED);
+	acl->al_count = 0;
+	acl->al_locked = 1;
+}
+
+/*
+ * Check if a token is in the access list (without enforcing).
+ * Returns 1 if token is in list, 0 if not.
+ * Caller must hold al_lock (shared or exclusive).
+ */
+static int
+cacl_acl_contains(struct cacl_acl *acl, uint64_t token)
+{
+
+	for (uint32_t i = 0; i < acl->al_count; i++) {
+		if (acl->al_tokens[i] == token)
+			return (1);
+	}
+	return (0);
 }
 
 /*
  * Check if a token is in the access list.
  * Returns 0 if allowed, EACCES if denied.
- * If list is empty (no CACL set), returns 0 (default-allow).
  * If acl is NULL (pre-existing object), returns 0 (default-allow).
+ * If list is empty and not locked, returns 0 (default-allow).
+ * If list is empty and locked, returns EACCES (deny-all).
  * Fires DTrace probe on denial.
  */
 static int
@@ -244,8 +280,15 @@ cacl_acl_check(struct cacl_acl *acl, uint64_t token, const char *op)
 
 	sx_slock(&acl->al_lock);
 
-	/* Empty list means no CACL - default allow. */
+	/* Empty list: check if locked (deny-all) or not (default-allow). */
 	if (acl->al_count == 0) {
+		if (acl->al_locked) {
+			sx_sunlock(&acl->al_lock);
+			SDT_PROBE1(cacl, , , deny, op);
+			if (cacl_verbose)
+				printf("cacl: denied %s (locked)\n", op);
+			return (EACCES);
+		}
 		sx_sunlock(&acl->al_lock);
 		return (0);
 	}
@@ -1216,6 +1259,90 @@ cacl_ioctl_clear(struct thread *td, struct cacl_fds *cf)
 	return (error);
 }
 
+static int
+cacl_ioctl_lock(struct thread *td, struct cacl_fds *cf)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	int error = 0;
+	int i;
+
+	if (cf->cf_cap_count == 0)
+		return (EINVAL);
+	if (cf->cf_cap_count > CACL_MAX_FDS)
+		return (EINVAL);
+
+	for (i = 0; i < cf->cf_cap_count; i++) {
+		int capfd;
+
+		error = copyin(&cf->cf_cap_fds[i], &capfd, sizeof(capfd));
+		if (error != 0)
+			return (error);
+
+		error = fget(td, capfd, &cap_no_rights, &capfp);
+		if (error != 0)
+			return (error);
+
+		/* Lock requires allocating ACL if not present. */
+		acl = cacl_acl_for_file(capfp, 1, NULL);
+		if (acl == NULL) {
+			fdrop(capfp, td);
+			return (EOPNOTSUPP);
+		}
+
+		sx_xlock(&acl->al_lock);
+		cacl_acl_lock(acl);
+		sx_xunlock(&acl->al_lock);
+
+		fdrop(capfp, td);
+	}
+
+	if (error == 0)
+		SDT_PROBE1(cacl, , , acl__modify, "lock");
+	return (error);
+}
+
+static int
+cacl_ioctl_query(struct thread *td, struct cacl_query *cq)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	uint64_t token;
+	int error;
+	int supported;
+
+	error = fget(td, cq->cq_cap_fd, &cap_no_rights, &capfp);
+	if (error != 0)
+		return (error);
+
+	acl = cacl_acl_for_file(capfp, 0, &supported);
+	if (!supported) {
+		fdrop(capfp, td);
+		return (EOPNOTSUPP);
+	}
+
+	/* Get the token for the process descriptor. */
+	token = cacl_token_for_procdesc(td, cq->cq_proc_fd);
+	if (token == 0) {
+		fdrop(capfp, td);
+		return (EINVAL);
+	}
+
+	/* No ACL means empty list - process not in it. */
+	if (acl == NULL) {
+		cq->cq_result = 0;
+		fdrop(capfp, td);
+		return (0);
+	}
+
+	sx_slock(&acl->al_lock);
+	cq->cq_result = cacl_acl_contains(acl, token);
+	sx_sunlock(&acl->al_lock);
+
+	fdrop(capfp, td);
+	return (0);
+}
+
 /* ========================================================================
  * Character Device
  * ======================================================================== */
@@ -1237,6 +1364,12 @@ cacl_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 
 	case CACL_IOC_CLEAR:
 		return (cacl_ioctl_clear(td, (struct cacl_fds *)data));
+
+	case CACL_IOC_LOCK:
+		return (cacl_ioctl_lock(td, (struct cacl_fds *)data));
+
+	case CACL_IOC_QUERY:
+		return (cacl_ioctl_query(td, (struct cacl_query *)data));
 
 	default:
 		return (ENOTTY);

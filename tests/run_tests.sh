@@ -24,6 +24,7 @@ TESTS="
 	test_threads
 	test_edge
 	test_comprehensive
+	test_lock_query
 "
 
 # Colors for output (use printf to interpret escapes)

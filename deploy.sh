@@ -54,6 +54,7 @@ scp -q \
     "$SCRIPT_DIR/tests/test_threads" \
     "$SCRIPT_DIR/tests/test_edge" \
     "$SCRIPT_DIR/tests/test_comprehensive" \
+    "$SCRIPT_DIR/tests/test_lock_query" \
     "$SCRIPT_DIR/tests/test_helper" \
     "$SCRIPT_DIR/tests/run_tests.sh" \
     "${USER}@${IP}:${REMOTE_DIR}/tests/"
