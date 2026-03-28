@@ -14,7 +14,8 @@ TESTS=	test_add_self \
 	test_unit \
 	test_ioctl \
 	test_threads \
-	test_edge
+	test_edge \
+	test_comprehensive
 
 HELPERS= test_helper
 
@@ -75,6 +76,9 @@ test_threads: test_threads.c test_common.h ../cacl.h
 
 test_edge: test_edge.c test_common.h ../cacl.h
 	$(CC) $(CFLAGS) -o $@ test_edge.c $(LDFLAGS)
+
+test_comprehensive: test_comprehensive.c test_common.h ../cacl.h
+	$(CC) $(CFLAGS) -o $@ test_comprehensive.c $(LDFLAGS)
 
 test_helper: test_helper.c
 	$(CC) $(CFLAGS) -o $@ test_helper.c $(LDFLAGS)

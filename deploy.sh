@@ -17,46 +17,45 @@ fi
 
 IP="$1"
 USER="${2:-root}"
-# Use /root instead of /tmp - /tmp is mounted nosuid which blocks
-# MAC credential transitions needed for exec token change tests.
 REMOTE_DIR="/root/cacl"
 
-cd "$(dirname "$0")"
+# Get absolute path to project root
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== Building locally ==="
-make clean && make
-cd tests && make clean && make && cd ..
+make -C "$SCRIPT_DIR" clean
+make -C "$SCRIPT_DIR"
+make -C "$SCRIPT_DIR/tests" clean
+make -C "$SCRIPT_DIR/tests"
 
 echo ""
 echo "=== Deploying to ${USER}@${IP} ==="
 
-# Create remote directory and copy
 ssh "${USER}@${IP}" "rm -rf ${REMOTE_DIR} && mkdir -p ${REMOTE_DIR}/tests"
 
-scp -q \
-    cacl.ko \
-    "${USER}@${IP}:${REMOTE_DIR}/"
+scp -q "$SCRIPT_DIR/cacl.ko" "${USER}@${IP}:${REMOTE_DIR}/"
 
 scp -q \
-    tests/test_add_self \
-    tests/test_add \
-    tests/test_remove \
-    tests/test_clear \
-    tests/test_exec \
-    tests/test_fork \
-    tests/test_socket \
-    tests/test_socket_ops \
-    tests/test_pipe_ops \
-    tests/test_shm \
-    tests/test_vnode \
-    tests/test_multi \
-    tests/test_errors \
-    tests/test_unit \
-    tests/test_ioctl \
-    tests/test_threads \
-    tests/test_edge \
-    tests/test_helper \
-    tests/run_tests.sh \
+    "$SCRIPT_DIR/tests/test_add_self" \
+    "$SCRIPT_DIR/tests/test_add" \
+    "$SCRIPT_DIR/tests/test_remove" \
+    "$SCRIPT_DIR/tests/test_clear" \
+    "$SCRIPT_DIR/tests/test_exec" \
+    "$SCRIPT_DIR/tests/test_fork" \
+    "$SCRIPT_DIR/tests/test_socket" \
+    "$SCRIPT_DIR/tests/test_socket_ops" \
+    "$SCRIPT_DIR/tests/test_pipe_ops" \
+    "$SCRIPT_DIR/tests/test_shm" \
+    "$SCRIPT_DIR/tests/test_vnode" \
+    "$SCRIPT_DIR/tests/test_multi" \
+    "$SCRIPT_DIR/tests/test_errors" \
+    "$SCRIPT_DIR/tests/test_unit" \
+    "$SCRIPT_DIR/tests/test_ioctl" \
+    "$SCRIPT_DIR/tests/test_threads" \
+    "$SCRIPT_DIR/tests/test_edge" \
+    "$SCRIPT_DIR/tests/test_comprehensive" \
+    "$SCRIPT_DIR/tests/test_helper" \
+    "$SCRIPT_DIR/tests/run_tests.sh" \
     "${USER}@${IP}:${REMOTE_DIR}/tests/"
 
 echo ""

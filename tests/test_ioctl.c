@@ -82,6 +82,20 @@ test_empty_arrays(void)
 	ASSERT(ret != 0, "ADD with proc_count=0 should fail");
 	ASSERT_EQ(errno, EINVAL, "expected EINVAL");
 
+	/* REMOVE with zero cap count. */
+	cm.cm_cap_count = 0;
+	cm.cm_proc_count = 1;
+	ret = ioctl(cacl_fd, CACL_IOC_REMOVE, &cm);
+	ASSERT(ret != 0, "REMOVE with cap_count=0 should fail");
+	ASSERT_EQ(errno, EINVAL, "expected EINVAL");
+
+	/* REMOVE with zero proc count. */
+	cm.cm_cap_count = 1;
+	cm.cm_proc_count = 0;
+	ret = ioctl(cacl_fd, CACL_IOC_REMOVE, &cm);
+	ASSERT(ret != 0, "REMOVE with proc_count=0 should fail");
+	ASSERT_EQ(errno, EINVAL, "expected EINVAL");
+
 	close(cacl_fd);
 	PASS();
 }
@@ -125,6 +139,26 @@ test_excessive_count(void)
 	cm.cm_proc_count = 2000;
 	ret = ioctl(cacl_fd, CACL_IOC_ADD, &cm);
 	ASSERT(ret != 0, "ADD with excessive proc_count should fail");
+	ASSERT_EQ(errno, EINVAL, "expected EINVAL");
+
+	/* REMOVE with excessive cap count. */
+	cm.cm_cap_count = 2000;
+	cm.cm_proc_count = 1;
+	ret = ioctl(cacl_fd, CACL_IOC_REMOVE, &cm);
+	ASSERT(ret != 0, "REMOVE with excessive cap_count should fail");
+	ASSERT_EQ(errno, EINVAL, "expected EINVAL");
+
+	/* REMOVE with excessive proc count. */
+	cm.cm_cap_count = 1;
+	cm.cm_proc_count = 2000;
+	ret = ioctl(cacl_fd, CACL_IOC_REMOVE, &cm);
+	ASSERT(ret != 0, "REMOVE with excessive proc_count should fail");
+	ASSERT_EQ(errno, EINVAL, "expected EINVAL");
+
+	/* CLEAR with excessive count. */
+	cf.cf_cap_count = 2000;
+	ret = ioctl(cacl_fd, CACL_IOC_CLEAR, &cf);
+	ASSERT(ret != 0, "CLEAR with excessive count should fail");
 	ASSERT_EQ(errno, EINVAL, "expected EINVAL");
 
 	close(pipe_r);

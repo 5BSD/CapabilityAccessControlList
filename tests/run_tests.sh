@@ -23,6 +23,7 @@ TESTS="
 	test_ioctl
 	test_threads
 	test_edge
+	test_comprehensive
 "
 
 # Colors for output (use printf to interpret escapes)

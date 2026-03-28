@@ -375,12 +375,6 @@ test_vnode_stat_denied(void)
 }
 
 /*
- * Note: poll denial tests removed - FreeBSD's poll() syscall stores fo_poll's
- * return value directly in revents, so MAC errors (EACCES) get interpreted as
- * event bits rather than errors. This is a kernel design limitation.
- */
-
-/*
  * Test: Exec'd child is denied mmap on file.
  */
 static int

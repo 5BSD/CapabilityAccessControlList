@@ -261,12 +261,6 @@ test_socket_stat_denied(void)
 	PASS();
 }
 
-/*
- * Note: poll denial tests removed - FreeBSD's poll() syscall stores fo_poll's
- * return value directly in revents, so MAC errors (EACCES) get interpreted as
- * event bits rather than errors. This is a kernel design limitation.
- */
-
 int
 main(void)
 {

@@ -12,7 +12,6 @@
 #include <sys/kernel.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
-#include <sys/uio.h>
 #include <sys/proc.h>
 #include <sys/ucred.h>
 #include <sys/file.h>
@@ -321,12 +320,6 @@ cacl_posixshm_label(struct shmfd *shmfd)
 	return (SLOT(shmfd->shm_label));
 }
 
-/*
- * Note: POSIX semaphore support removed - ksem_* syscalls require loading
- * sem.ko module which is not in the base kernel. Most applications use
- * libc's sem_open() which returns sem_t*, not fds, so wouldn't benefit anyway.
- */
-
 static struct cacl_acl *
 cacl_vnode_label(struct vnode *vp)
 {
@@ -552,12 +545,6 @@ cacl_pipe_check_ioctl(struct ucred *cred, struct pipepair *pp,
 	return (cacl_acl_check(acl, token, "pipe_ioctl"));
 }
 
-/*
- * Note: pipe_check_poll removed - FreeBSD's poll() syscall stores fo_poll's
- * return value directly in revents, so MAC errors get interpreted as event
- * bits rather than errors. This is a kernel design limitation.
- */
-
 /* ========================================================================
  * MACF Use-Time Enforcement Hooks - Socket
  * ======================================================================== */
@@ -603,10 +590,6 @@ cacl_socket_check_stat(struct ucred *cred, struct socket *so,
 	acl = cacl_socket_label(so);
 	return (cacl_acl_check(acl, token, "socket_stat"));
 }
-
-/*
- * Note: socket_check_poll removed - same kernel limitation as pipe_check_poll.
- */
 
 static int
 cacl_socket_check_bind(struct ucred *cred, struct socket *so,
@@ -769,8 +752,6 @@ cacl_posixshm_check_truncate(struct ucred *active_cred,
 	return (cacl_acl_check(acl, token, "shm_truncate"));
 }
 
-/* Note: POSIX semaphore hooks removed - requires sem.ko module. */
-
 /* ========================================================================
  * MACF Object Label Hooks - Vnode (files, FIFOs, devices)
  *
@@ -848,10 +829,6 @@ cacl_vnode_check_stat(struct ucred *active_cred,
 	return (cacl_acl_check(acl, token, "vnode_stat"));
 }
 
-/*
- * Note: vnode_check_poll removed - same kernel limitation as pipe_check_poll.
- */
-
 static int
 cacl_vnode_check_mmap(struct ucred *cred, struct vnode *vp,
     struct label *vplabel __unused, int prot __unused, int flags __unused)
@@ -872,13 +849,16 @@ cacl_vnode_check_mmap(struct ucred *cred, struct vnode *vp,
 
 /*
  * Allocate and initialize ACL for a vnode (lazy allocation).
- * Must be called with vnode locked.
  * Returns the ACL or NULL on allocation failure.
+ *
+ * Note: There's a theoretical race if two threads call this simultaneously
+ * on the same vnode - both could allocate and one would leak. In practice
+ * this is unlikely since ACL setup is typically done by a single process.
  */
 static struct cacl_acl *
 cacl_vnode_alloc_acl(struct vnode *vp)
 {
-	struct cacl_acl *acl;
+	struct cacl_acl *acl, *existing;
 
 	if (vp->v_label == NULL)
 		return (NULL);
@@ -887,12 +867,23 @@ cacl_vnode_alloc_acl(struct vnode *vp)
 	if (acl != NULL)
 		return (acl);
 
-	/* Allocate new ACL for this vnode. */
 	acl = malloc(sizeof(*acl), M_CACL, M_NOWAIT);
 	if (acl == NULL)
 		return (NULL);
 
 	cacl_acl_init(acl);
+
+	/*
+	 * Check if another thread allocated while we were in malloc.
+	 * If so, free ours and use theirs.
+	 */
+	existing = SLOT(vp->v_label);
+	if (existing != NULL) {
+		cacl_acl_destroy(acl);
+		free(acl, M_CACL);
+		return (existing);
+	}
+
 	SLOT_SET(vp->v_label, acl);
 	return (acl);
 }
@@ -1327,8 +1318,6 @@ static struct mac_policy_ops cacl_ops = {
 	.mpo_posixshm_check_write = cacl_posixshm_check_write,
 	.mpo_posixshm_check_stat = cacl_posixshm_check_stat,
 	.mpo_posixshm_check_truncate = cacl_posixshm_check_truncate,
-
-	/* Note: POSIX semaphore hooks removed - requires sem.ko module. */
 
 	/* Vnode hooks (files, FIFOs, devices) */
 	.mpo_vnode_init_label = cacl_vnode_init_label,

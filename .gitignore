@@ -67,6 +67,14 @@ opt_*.h
 # Core dumps
 *.core
 
+# FreeBSD vnode interface headers (generated)
+vnode_if.h
+vnode_if_newproto.h
+vnode_if_typedef.h
+
+# Kernel module link
+*.kld
+
 # Test binaries
 tests/test_add_self
 tests/test_add
@@ -74,3 +82,17 @@ tests/test_remove
 tests/test_clear
 tests/test_exec
 tests/test_fork
+tests/test_socket
+tests/test_socket_ops
+tests/test_pipe_ops
+tests/test_shm
+tests/test_vnode
+tests/test_multi
+tests/test_errors
+tests/test_unit
+tests/test_ioctl
+tests/test_threads
+tests/test_edge
+tests/test_comprehensive
+tests/test_helper
+tests/test_sem
