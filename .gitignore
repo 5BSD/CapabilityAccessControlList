@@ -97,3 +97,6 @@ tests/test_comprehensive
 tests/test_lock_query
 tests/test_helper
 tests/test_sem
+tests/test_remove_self
+tests/test_auto_cleanup
+tests/test_timed
