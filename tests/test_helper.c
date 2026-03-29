@@ -152,7 +152,7 @@ try_add_self_auto(int fd)
 
 	cf.cf_cap_fds = &fd;
 	cf.cf_cap_count = 1;
-	ret = ioctl(cacl_fd, CACL_IOC_ADD_SELF_AUTO, &cf);
+	ret = ioctl(cacl_fd, CACL_IOC_ADD_SELF, &cf);
 	close(cacl_fd);
 
 	return (ret == 0 ? 0 : 1);

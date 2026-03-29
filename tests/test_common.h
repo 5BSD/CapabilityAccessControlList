@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * CACL Test Framework - Common definitions and utilities.
+ *
+ * All ACL entries have automatic cleanup: entries are removed when
+ * no process holds the associated token (all exited or exec'd).
  */
 
 #ifndef _TEST_COMMON_H_
@@ -84,6 +87,7 @@ cacl_open(void)
 
 /*
  * Helper to add self to a capability's access list.
+ * Entry auto-cleans when no process holds this token.
  */
 static inline int
 cacl_add_self(int cacl_fd, int *cap_fds, int cap_count)
@@ -96,21 +100,8 @@ cacl_add_self(int cacl_fd, int *cap_fds, int cap_count)
 }
 
 /*
- * Helper to add self to a capability's access list with auto-cleanup.
- * Entry is automatically removed when no process holds this token.
- */
-static inline int
-cacl_add_self_auto(int cacl_fd, int *cap_fds, int cap_count)
-{
-	struct cacl_fds cf;
-
-	cf.cf_cap_fds = cap_fds;
-	cf.cf_cap_count = cap_count;
-	return (ioctl(cacl_fd, CACL_IOC_ADD_SELF_AUTO, &cf));
-}
-
-/*
  * Helper to add processes to a capability's access list.
+ * Entries auto-cleanup when no process holds the token.
  */
 static inline int
 cacl_add(int cacl_fd, int *cap_fds, int cap_count,
@@ -126,20 +117,37 @@ cacl_add(int cacl_fd, int *cap_fds, int cap_count,
 }
 
 /*
- * Helper to add processes to a capability's access list with auto-cleanup.
- * Entries are automatically removed when no process holds the token.
+ * Helper to add processes with expiry timeout.
+ * Entries removed after timeout OR when no process holds the token.
  */
 static inline int
-cacl_add_auto(int cacl_fd, int *cap_fds, int cap_count,
-    int *proc_fds, int proc_count)
+cacl_add_timed(int cacl_fd, int *cap_fds, int cap_count,
+    int *proc_fds, int proc_count, uint32_t timeout_sec)
 {
-	struct cacl_members cm;
+	struct cacl_members_timed cmt;
 
-	cm.cm_cap_fds = cap_fds;
-	cm.cm_cap_count = cap_count;
-	cm.cm_proc_fds = proc_fds;
-	cm.cm_proc_count = proc_count;
-	return (ioctl(cacl_fd, CACL_IOC_ADD_AUTO, &cm));
+	cmt.cmt_cap_fds = cap_fds;
+	cmt.cmt_cap_count = cap_count;
+	cmt.cmt_proc_fds = proc_fds;
+	cmt.cmt_proc_count = proc_count;
+	cmt.cmt_timeout_sec = timeout_sec;
+	return (ioctl(cacl_fd, CACL_IOC_ADD_TIMED, &cmt));
+}
+
+/*
+ * Helper to add self with expiry timeout.
+ * Entry removed after timeout OR when no process holds this token.
+ */
+static inline int
+cacl_add_self_timed(int cacl_fd, int *cap_fds, int cap_count,
+    uint32_t timeout_sec)
+{
+	struct cacl_fds_timed cft;
+
+	cft.cft_cap_fds = cap_fds;
+	cft.cft_cap_count = cap_count;
+	cft.cft_timeout_sec = timeout_sec;
+	return (ioctl(cacl_fd, CACL_IOC_ADD_SELF_TIMED, &cft));
 }
 
 /*
@@ -156,6 +164,19 @@ cacl_remove(int cacl_fd, int *cap_fds, int cap_count,
 	cm.cm_proc_fds = proc_fds;
 	cm.cm_proc_count = proc_count;
 	return (ioctl(cacl_fd, CACL_IOC_REMOVE, &cm));
+}
+
+/*
+ * Helper to remove self from a capability's access list.
+ */
+static inline int
+cacl_remove_self(int cacl_fd, int *cap_fds, int cap_count)
+{
+	struct cacl_fds cf;
+
+	cf.cf_cap_fds = cap_fds;
+	cf.cf_cap_count = cap_count;
+	return (ioctl(cacl_fd, CACL_IOC_REMOVE_SELF, &cf));
 }
 
 /*
@@ -200,6 +221,29 @@ cacl_query(int cacl_fd, int cap_fd, int proc_fd, int *is_member)
 	ret = ioctl(cacl_fd, CACL_IOC_QUERY, &cq);
 	if (ret == 0 && is_member != NULL)
 		*is_member = cq.cq_result;
+	return (ret);
+}
+
+/*
+ * Helper to count entries in a capability's access list.
+ * Returns 0 on success, with count in *count and locked state in *locked.
+ */
+static inline int
+cacl_count(int cacl_fd, int cap_fd, uint32_t *count, int *locked)
+{
+	struct cacl_count cc;
+	int ret;
+
+	cc.cc_cap_fd = cap_fd;
+	cc.cc_count = 0;
+	cc.cc_locked = 0;
+	ret = ioctl(cacl_fd, CACL_IOC_COUNT, &cc);
+	if (ret == 0) {
+		if (count != NULL)
+			*count = cc.cc_count;
+		if (locked != NULL)
+			*locked = cc.cc_locked;
+	}
 	return (ret);
 }
 

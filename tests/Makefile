@@ -1,6 +1,7 @@
 TESTS=	test_add_self \
 	test_add \
 	test_remove \
+	test_remove_self \
 	test_clear \
 	test_exec \
 	test_fork \
@@ -36,6 +37,9 @@ test_add: test_add.c test_common.h ../cacl.h
 
 test_remove: test_remove.c test_common.h ../cacl.h
 	$(CC) $(CFLAGS) -o $@ test_remove.c $(LDFLAGS)
+
+test_remove_self: test_remove_self.c test_common.h ../cacl.h
+	$(CC) $(CFLAGS) -o $@ test_remove_self.c $(LDFLAGS)
 
 test_clear: test_clear.c test_common.h ../cacl.h
 	$(CC) $(CFLAGS) -o $@ test_clear.c $(LDFLAGS)

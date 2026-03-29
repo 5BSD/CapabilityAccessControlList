@@ -1,17 +1,17 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * Test CACL_IOC_ADD_SELF_AUTO (auto-cleanup) feature.
+ * Test auto-cleanup feature.
  *
- * Auto-cleanup entries are automatically removed when no process
- * holds the associated token anymore (all exited or exec'd).
+ * All ACL entries have automatic cleanup: entries are removed when
+ * no process holds the associated token anymore (all exited or exec'd).
  *
  * Verifies:
  * 1. Basic auto-cleanup after process exit
  * 2. Fork inherits token, keeps refcount alive
  * 3. Exec gets new token, old token's refcount drops
  * 4. Multiple children keep entry alive until all exit
- * 5. Mixed regular and auto-cleanup entries
+ * 5. Multiple entries with different tokens tracked independently
  * 6. Entry survives while any holder is alive
  */
 
@@ -21,7 +21,7 @@
 /*
  * Test: Basic auto-cleanup after exec.
  *
- * 1. Fork child, child adds self with auto-cleanup
+ * 1. Fork child, child adds self (auto-cleanup)
  * 2. Child execs test_helper (gets new token)
  * 3. Verify entry is cleaned up on next access check
  *
@@ -53,12 +53,12 @@ test_auto_cleanup_after_exec(void)
 	ASSERT(pid >= 0, "pdfork failed");
 
 	if (pid == 0) {
-		/* Child: add self with auto-cleanup, then exec. */
+		/* Child: add self, then exec. */
 		close(pipe_r);
 		close(sync_pipe[0]);
 
-		/* Add self with auto-cleanup flag. */
-		ret = cacl_add_self_auto(cacl_fd, &pipe_w, 1);
+		/* Add self to ACL. */
+		ret = cacl_add_self(cacl_fd, &pipe_w, 1);
 		if (ret != 0)
 			_exit(10);
 
@@ -109,9 +109,9 @@ test_auto_cleanup_after_exec(void)
 }
 
 /*
- * Test: Fork keeps auto-cleanup entry alive.
+ * Test: Fork keeps entry alive.
  *
- * 1. Parent adds self with auto-cleanup
+ * 1. Parent adds self (auto-cleanup)
  * 2. Fork child (inherits token, increments refcount)
  * 3. Parent still alive, entry should persist
  * 4. Child execs (gets new token), but parent still has original token
@@ -135,9 +135,9 @@ test_auto_cleanup_fork_keeps_alive(void)
 	ret = create_pipe(&pipe_r, &pipe_w);
 	ASSERT(ret == 0, "create_pipe failed");
 
-	/* Parent adds self with auto-cleanup. */
-	ret = cacl_add_self_auto(cacl_fd, &pipe_w, 1);
-	ASSERT_EQ(ret, 0, "cacl_add_self_auto failed");
+	/* Parent adds self. */
+	ret = cacl_add_self(cacl_fd, &pipe_w, 1);
+	ASSERT_EQ(ret, 0, "cacl_add_self failed");
 
 	ret = pipe(sync_pipe);
 	ASSERT(ret == 0, "sync pipe failed");
@@ -195,7 +195,7 @@ test_auto_cleanup_fork_keeps_alive(void)
 /*
  * Test: Multiple children keep entry alive.
  *
- * 1. Parent adds self with auto-cleanup
+ * 1. Parent adds self (auto-cleanup)
  * 2. Fork two children (both inherit token)
  * 3. First child execs (drops its refcount)
  * 4. Entry still valid (second child + parent have it)
@@ -220,9 +220,9 @@ test_auto_cleanup_multiple_children(void)
 	ret = create_pipe(&pipe_r, &pipe_w);
 	ASSERT(ret == 0, "create_pipe failed");
 
-	/* Parent adds self with auto-cleanup. */
-	ret = cacl_add_self_auto(cacl_fd, &pipe_w, 1);
-	ASSERT_EQ(ret, 0, "cacl_add_self_auto failed");
+	/* Parent adds self. */
+	ret = cacl_add_self(cacl_fd, &pipe_w, 1);
+	ASSERT_EQ(ret, 0, "cacl_add_self failed");
 
 	ret = pipe(sync1);
 	ASSERT(ret == 0, "sync1 pipe failed");
@@ -303,10 +303,10 @@ test_auto_cleanup_multiple_children(void)
 }
 
 /*
- * Test: Regular and auto-cleanup entries coexist.
+ * Test: Entries with different tokens are tracked independently.
  *
- * 1. Process A adds self with regular add (no auto-cleanup)
- * 2. Process B adds self with auto-cleanup
+ * 1. Process A adds self
+ * 2. Process B (different token after exec) adds self
  * 3. Process B exits/execs
  * 4. Process B's entry cleaned up, but Process A's entry remains
  */
@@ -330,7 +330,7 @@ test_auto_cleanup_mixed_entries(void)
 	ret = create_pipe(&pipe_r, &pipe_w);
 	ASSERT(ret == 0, "create_pipe failed");
 
-	/* Parent adds self with REGULAR add (no auto-cleanup). */
+	/* Parent adds self. */
 	ret = cacl_add_self(cacl_fd, &pipe_w, 1);
 	ASSERT_EQ(ret, 0, "cacl_add_self failed");
 
@@ -343,8 +343,8 @@ test_auto_cleanup_mixed_entries(void)
 	if (pid == 0) {
 		close(sync_pipe[0]);
 
-		/* Child adds self with auto-cleanup. */
-		ret = cacl_add_self_auto(cacl_fd, &pipe_w, 1);
+		/* Child adds self. */
+		ret = cacl_add_self(cacl_fd, &pipe_w, 1);
 		if (ret != 0)
 			_exit(10);
 
@@ -403,15 +403,15 @@ test_auto_cleanup_mixed_entries(void)
 /*
  * Test: Verify exec'd child is denied access (new token not in ACL).
  *
- * 1. Parent adds self (regular entry)
+ * 1. Parent adds self
  * 2. Fork child (inherits parent's token)
- * 3. Child adds self with auto-cleanup (same token as parent)
+ * 3. Child adds self (same token as parent)
  * 4. Child execs (gets new token)
  * 5. Child tries to write - denied because new token not in ACL
  *
- * Note: The auto-cleanup entry isn't actually cleaned here because
- * parent still holds the original token (refcount > 0). The child
- * is denied because exec gave it a NEW token that isn't in the ACL.
+ * Note: The entry isn't cleaned up here because parent still holds
+ * the original token (refcount > 0). The child is denied because
+ * exec gave it a NEW token that isn't in the ACL.
  */
 static int
 test_auto_cleanup_exec_denied(void)
@@ -448,8 +448,8 @@ test_auto_cleanup_exec_denied(void)
 		close(sync1[0]);
 		close(sync2[1]);
 
-		/* Add self with auto-cleanup. */
-		ret = cacl_add_self_auto(cacl_fd, &pipe_w, 1);
+		/* Add self. */
+		ret = cacl_add_self(cacl_fd, &pipe_w, 1);
 		if (ret != 0)
 			_exit(10);
 
@@ -479,7 +479,7 @@ test_auto_cleanup_exec_denied(void)
 	ASSERT(ret == 1, "sync1 read failed");
 	close(sync1[0]);
 
-	/* At this point child has auto-cleanup entry. */
+	/* At this point child has an ACL entry. */
 
 	/* Signal child to exec. */
 	write(sync2[1], "g", 1);
@@ -489,7 +489,7 @@ test_auto_cleanup_exec_denied(void)
 	usleep(100000);
 
 	/* Parent does a write to trigger lazy cleanup.
-	 * The child's old auto-cleanup entry should be removed. */
+	 * The child's old entry should be removed. */
 	ret = write(pipe_w, "t", 1);
 	ASSERT_EQ(ret, 1, "parent trigger write failed");
 
@@ -511,7 +511,7 @@ test_auto_cleanup_exec_denied(void)
 /*
  * Test: Forked child without exec retains access.
  *
- * 1. Parent adds self with auto-cleanup
+ * 1. Parent adds self
  * 2. Fork child (inherits token)
  * 3. Child tries to write WITHOUT exec - should succeed
  */
@@ -533,9 +533,9 @@ test_auto_cleanup_fork_without_exec(void)
 	ret = create_pipe(&pipe_r, &pipe_w);
 	ASSERT(ret == 0, "create_pipe failed");
 
-	/* Parent adds self with auto-cleanup. */
-	ret = cacl_add_self_auto(cacl_fd, &pipe_w, 1);
-	ASSERT_EQ(ret, 0, "cacl_add_self_auto failed");
+	/* Parent adds self. */
+	ret = cacl_add_self(cacl_fd, &pipe_w, 1);
+	ASSERT_EQ(ret, 0, "cacl_add_self failed");
 
 	ret = pipe(sync_pipe);
 	ASSERT(ret == 0, "sync pipe failed");
@@ -590,10 +590,10 @@ test_auto_cleanup_fork_without_exec(void)
  * Test: Verify lazy cleanup actually removes stale entries.
  *
  * This test verifies that when a token's refcount drops to 0,
- * the auto-cleanup entry is actually removed from the ACL.
+ * the entry is actually removed from the ACL.
  *
  * 1. Fork child, child execs test_helper "add_self_auto" (unique token)
- * 2. test_helper adds itself with auto-cleanup and exits
+ * 2. test_helper adds itself and exits
  * 3. Child's token refcount drops to 0
  * 4. Parent triggers lazy cleanup by accessing pipe
  * 5. Entry should be removed - pipe returns to default-allow
@@ -624,7 +624,7 @@ test_auto_cleanup_entry_removed(void)
 	ASSERT(pid >= 0, "fork failed");
 
 	if (pid == 0) {
-		/* Child: exec test_helper to add self with auto-cleanup. */
+		/* Child: exec test_helper to add self. */
 		close(pipe_r);
 		close(sync_pipe[1]);
 		close(cacl_fd);
@@ -634,7 +634,7 @@ test_auto_cleanup_entry_removed(void)
 		close(sync_pipe[0]);
 
 		/* Exec test_helper - this gives us a unique token.
-		 * test_helper will add itself with auto-cleanup and exit. */
+		 * test_helper will add itself and exit. */
 		if (dup2(pipe_w, 3) < 0)
 			_exit(10);
 		close(pipe_w);
@@ -655,7 +655,7 @@ test_auto_cleanup_entry_removed(void)
 	ASSERT_EQ(WEXITSTATUS(status), 0, "test_helper add_self_auto failed");
 
 	/* Child has exited. Its unique token now has refcount 0.
-	 * The auto-cleanup entry should be removed on next access check. */
+	 * The entry should be removed on next access check. */
 
 	/* Parent writes to trigger lazy cleanup.
 	 * If cleanup works, ACL is now empty = default-allow. */
@@ -673,14 +673,14 @@ test_auto_cleanup_entry_removed(void)
 }
 
 /*
- * Test: Supervisor adds child with ADD_AUTO, child exits, entry cleaned.
+ * Test: Supervisor adds child, child exits, entry cleaned.
  *
- * This tests the CACL_IOC_ADD_AUTO ioctl which allows a supervisor to
- * add a child process (by process descriptor) with auto-cleanup.
+ * This tests the CACL_IOC_ADD ioctl which allows a supervisor to
+ * add a child process by process descriptor.
  *
  * 1. Parent creates pipe, forks child with pdfork
  * 2. Child execs test_helper (gets unique token)
- * 3. Parent adds child to ACL using ADD_AUTO
+ * 3. Parent adds child to ACL
  * 4. Child writes to pipe - should succeed
  * 5. Child exits, token refcount drops to 0
  * 6. Parent triggers cleanup, entry is removed
@@ -748,9 +748,9 @@ test_add_auto_supervisor(void)
 	ret = cacl_add_self(cacl_fd, &pipe_w, 1);
 	ASSERT_EQ(ret, 0, "cacl_add_self failed");
 
-	/* Add child using ADD_AUTO. */
-	ret = cacl_add_auto(cacl_fd, &pipe_w, 1, &proc_fd, 1);
-	ASSERT_EQ(ret, 0, "cacl_add_auto failed");
+	/* Add child. */
+	ret = cacl_add(cacl_fd, &pipe_w, 1, &proc_fd, 1);
+	ASSERT_EQ(ret, 0, "cacl_add failed");
 
 	/* Signal child to write. */
 	write(sync_pipe[1], "g", 1);
@@ -766,7 +766,6 @@ test_add_auto_supervisor(void)
 	ASSERT_EQ(ret, 1, "should have received child's write");
 
 	/* Child has exited. Its token refcount is now 0.
-	 * Parent's entry is regular (no auto-cleanup).
 	 * Child's entry should be cleaned up on next access. */
 
 	/* Trigger cleanup by parent accessing pipe. */
@@ -785,9 +784,9 @@ test_add_auto_supervisor(void)
 }
 
 /*
- * Test: ADD_AUTO entry cleaned up allows new process to access.
+ * Test: Entry cleanup allows new process to access.
  *
- * 1. Parent adds child1 with ADD_AUTO
+ * 1. Parent adds child1
  * 2. Child1 can access
  * 3. Child1 exits (entry cleaned)
  * 4. Fork child2 (doesn't exec, so no entry for it)
@@ -815,7 +814,7 @@ test_add_auto_cleanup_allows_new_access(void)
 	ret = pipe(sync_pipe);
 	ASSERT(ret == 0, "sync_pipe failed");
 
-	/* Child1: will be added with ADD_AUTO. */
+	/* Child1: will be added to ACL. */
 	pid1 = pdfork(&proc_fd, 0);
 	ASSERT(pid1 >= 0, "pdfork failed");
 
@@ -847,9 +846,9 @@ test_add_auto_cleanup_allows_new_access(void)
 	close(sync_pipe[0]);
 	usleep(100000);
 
-	/* Add child1 with ADD_AUTO (only entry in ACL). */
-	ret = cacl_add_auto(cacl_fd, &pipe_w, 1, &proc_fd, 1);
-	ASSERT_EQ(ret, 0, "cacl_add_auto failed");
+	/* Add child1 (only entry in ACL). */
+	ret = cacl_add(cacl_fd, &pipe_w, 1, &proc_fd, 1);
+	ASSERT_EQ(ret, 0, "cacl_add failed");
 
 	/* Signal child1 to write and exit. */
 	write(sync_pipe[1], "g", 1);

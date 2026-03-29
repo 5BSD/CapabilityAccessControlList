@@ -40,6 +40,8 @@
  *
  * Usage:
  *   dtrace -n 'cacl::deny { printf("%s pid=%d op=%s", execname, pid, arg0); }'
+ *   dtrace -n 'cacl::deny-detail { printf("%s pid=%d op=%s token=%llx reason=%s",
+ *       execname, pid, arg0, arg1, arg2); }'
  *   dtrace -n 'cacl::token-change { printf("%s pid=%d", execname, pid); }'
  */
 SDT_PROVIDER_DECLARE(cacl);
@@ -48,11 +50,23 @@ SDT_PROVIDER_DEFINE(cacl);
 /* Fired when access is denied: arg0 = operation name */
 SDT_PROBE_DEFINE1(cacl, , , deny, "const char *");
 
+/*
+ * Detailed denial probe:
+ *   arg0 = operation name
+ *   arg1 = token that was denied (uint64_t)
+ *   arg2 = reason: "not_in_acl", "locked", "expired"
+ */
+SDT_PROBE_DEFINE3(cacl, , , deny__detail,
+    "const char *", "uint64_t", "const char *");
+
 /* Fired when a process gets a new token (exec) */
 SDT_PROBE_DEFINE1(cacl, , , token__change, "uint64_t");
 
 /* Fired when ACL is modified: arg0 = operation (add/remove/clear) */
 SDT_PROBE_DEFINE1(cacl, , , acl__modify, "const char *");
+
+/* Fired when entry is cleaned up: arg0 = reason ("expired", "auto_cleanup") */
+SDT_PROBE_DEFINE2(cacl, , , entry__cleanup, "const char *", "uint64_t");
 
 #include "cacl.h"
 
@@ -64,6 +78,32 @@ MALLOC_DEFINE(M_CACL, "cacl", "Capability Access Control List");
 static int cacl_verbose = 0;
 SYSCTL_INT(_security, OID_AUTO, cacl_verbose, CTLFLAG_RW, &cacl_verbose, 0,
     "Log CACL access denials to kernel message buffer");
+
+/*
+ * Sysctl statistics counters.
+ */
+SYSCTL_NODE(_security, OID_AUTO, cacl, CTLFLAG_RW, 0,
+    "Capability Access Control List statistics");
+
+static uint64_t cacl_stat_acls_created = 0;
+static uint64_t cacl_stat_entries_added = 0;
+static uint64_t cacl_stat_entries_removed = 0;
+static uint64_t cacl_stat_auto_cleanups = 0;
+static uint64_t cacl_stat_access_denied = 0;
+static uint64_t cacl_stat_access_allowed = 0;
+
+SYSCTL_U64(_security_cacl, OID_AUTO, acls_created, CTLFLAG_RD,
+    &cacl_stat_acls_created, 0, "Number of ACLs created");
+SYSCTL_U64(_security_cacl, OID_AUTO, entries_added, CTLFLAG_RD,
+    &cacl_stat_entries_added, 0, "Number of entries added to ACLs");
+SYSCTL_U64(_security_cacl, OID_AUTO, entries_removed, CTLFLAG_RD,
+    &cacl_stat_entries_removed, 0, "Number of entries removed from ACLs");
+SYSCTL_U64(_security_cacl, OID_AUTO, auto_cleanups, CTLFLAG_RD,
+    &cacl_stat_auto_cleanups, 0, "Number of auto-cleanup removals");
+SYSCTL_U64(_security_cacl, OID_AUTO, access_denied, CTLFLAG_RD,
+    &cacl_stat_access_denied, 0, "Number of access denials");
+SYSCTL_U64(_security_cacl, OID_AUTO, access_allowed, CTLFLAG_RD,
+    &cacl_stat_access_allowed, 0, "Number of access grants (with ACL)");
 
 /*
  * Maximum number of file descriptors per ioctl call.
@@ -109,11 +149,12 @@ static struct mtx cacl_token_mtx;
 static LIST_HEAD(, cacl_token_ref) cacl_token_hash[CACL_TOKEN_HASH_SIZE];
 
 /*
- * ACL entry - token plus flags.
+ * ACL entry - token plus flags and optional expiry.
  */
 struct cacl_entry {
 	uint64_t	 ce_token;	/* process token                */
 	uint8_t		 ce_flags;	/* CACL_ENTRY_* flags           */
+	time_t		 ce_expires;	/* expiry time (0 = no expiry)  */
 };
 
 /*
@@ -150,7 +191,8 @@ static struct cdev *cacl_dev;
  */
 static void	cacl_acl_init(struct cacl_acl *acl);
 static void	cacl_acl_destroy(struct cacl_acl *acl);
-static int	cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags);
+static int	cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags,
+		    time_t expires);
 static int	cacl_acl_remove(struct cacl_acl *acl, uint64_t token);
 static void	cacl_acl_clear(struct cacl_acl *acl);
 static void	cacl_acl_lock(struct cacl_acl *acl);
@@ -303,10 +345,11 @@ cacl_acl_destroy(struct cacl_acl *acl)
 /*
  * Add a token to the access list. Returns 0 on success, ENOMEM on failure,
  * ENOSPC if maximum ACL size reached.
+ * expires = 0 means no expiry.
  * Caller must hold al_lock exclusively.
  */
 static int
-cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags)
+cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags, time_t expires)
 {
 	struct cacl_entry *newentries;
 	uint32_t newcap;
@@ -318,6 +361,10 @@ cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags)
 		if (acl->al_entries[i].ce_token == token) {
 			/* Update flags if adding with different flags. */
 			acl->al_entries[i].ce_flags |= flags;
+			/* Update expiry if new one is later (or becomes permanent). */
+			if (expires == 0 || (acl->al_entries[i].ce_expires != 0 &&
+			    expires > acl->al_entries[i].ce_expires))
+				acl->al_entries[i].ce_expires = expires;
 			return (0);
 		}
 	}
@@ -345,7 +392,9 @@ cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags)
 
 	acl->al_entries[acl->al_count].ce_token = token;
 	acl->al_entries[acl->al_count].ce_flags = flags;
+	acl->al_entries[acl->al_count].ce_expires = expires;
 	acl->al_count++;
+	atomic_add_64(&cacl_stat_entries_added, 1);
 	return (0);
 }
 
@@ -364,6 +413,7 @@ cacl_acl_remove(struct cacl_acl *acl, uint64_t token)
 			/* Swap with last and decrement count. */
 			acl->al_entries[i] = acl->al_entries[acl->al_count - 1];
 			acl->al_count--;
+			atomic_add_64(&cacl_stat_entries_removed, 1);
 			return (0);
 		}
 	}
@@ -414,24 +464,42 @@ cacl_acl_contains(struct cacl_acl *acl, uint64_t token)
 }
 
 /*
- * Perform lazy cleanup of stale auto_cleanup entries.
- * Removes entries where the token's refcount has dropped to 0.
+ * Perform lazy cleanup of stale entries.
+ * Removes entries where:
+ *   - auto_cleanup flag is set and token's refcount has dropped to 0
+ *   - entry has expired (ce_expires != 0 and ce_expires <= now)
  * Caller must hold al_lock exclusively.
  */
 static void
 cacl_acl_lazy_cleanup(struct cacl_acl *acl)
 {
 	uint32_t i;
+	time_t now;
 
 	sx_assert(&acl->al_lock, SX_XLOCKED);
 
+	now = time_second;
 	i = 0;
 	while (i < acl->al_count) {
-		if ((acl->al_entries[i].ce_flags & CACL_ENTRY_AUTO_CLEANUP) &&
-		    cacl_token_ref_get(acl->al_entries[i].ce_token) == 0) {
-			/* Token is dead - remove entry. */
+		const char *reason = NULL;
+		uint64_t token = acl->al_entries[i].ce_token;
+
+		/* Check for expiry. */
+		if (acl->al_entries[i].ce_expires != 0 &&
+		    acl->al_entries[i].ce_expires <= now) {
+			reason = "expired";
+		}
+		/* Check for auto-cleanup (dead token). */
+		else if ((acl->al_entries[i].ce_flags & CACL_ENTRY_AUTO_CLEANUP) &&
+		    cacl_token_ref_get(token) == 0) {
+			reason = "auto_cleanup";
+		}
+
+		if (reason != NULL) {
 			acl->al_entries[i] = acl->al_entries[acl->al_count - 1];
 			acl->al_count--;
+			atomic_add_64(&cacl_stat_auto_cleanups, 1);
+			SDT_PROBE2(cacl, , , entry__cleanup, reason, token);
 			/* Don't increment i - check swapped entry. */
 		} else {
 			i++;
@@ -464,10 +532,18 @@ cacl_acl_check(struct cacl_acl *acl, uint64_t token, const char *op)
 	sx_slock(&acl->al_lock);
 
 	/* Quick scan to see if lazy cleanup is needed. */
-	for (uint32_t i = 0; i < acl->al_count; i++) {
-		if (acl->al_entries[i].ce_flags & CACL_ENTRY_AUTO_CLEANUP) {
-			need_cleanup = 1;
-			break;
+	{
+		time_t now = time_second;
+		for (uint32_t i = 0; i < acl->al_count; i++) {
+			if (acl->al_entries[i].ce_flags & CACL_ENTRY_AUTO_CLEANUP) {
+				need_cleanup = 1;
+				break;
+			}
+			if (acl->al_entries[i].ce_expires != 0 &&
+			    acl->al_entries[i].ce_expires <= now) {
+				need_cleanup = 1;
+				break;
+			}
 		}
 	}
 
@@ -483,7 +559,9 @@ cacl_acl_check(struct cacl_acl *acl, uint64_t token, const char *op)
 	if (acl->al_count == 0) {
 		if (acl->al_locked) {
 			sx_sunlock(&acl->al_lock);
+			atomic_add_64(&cacl_stat_access_denied, 1);
 			SDT_PROBE1(cacl, , , deny, op);
+			SDT_PROBE3(cacl, , , deny__detail, op, token, "locked");
 			if (cacl_verbose)
 				printf("cacl: denied %s (locked)\n", op);
 			return (EACCES);
@@ -495,12 +573,15 @@ cacl_acl_check(struct cacl_acl *acl, uint64_t token, const char *op)
 	for (uint32_t i = 0; i < acl->al_count; i++) {
 		if (acl->al_entries[i].ce_token == token) {
 			sx_sunlock(&acl->al_lock);
+			atomic_add_64(&cacl_stat_access_allowed, 1);
 			return (0);
 		}
 	}
 
 	sx_sunlock(&acl->al_lock);
+	atomic_add_64(&cacl_stat_access_denied, 1);
 	SDT_PROBE1(cacl, , , deny, op);
+	SDT_PROBE3(cacl, , , deny__detail, op, token, "not_in_acl");
 	if (cacl_verbose)
 		printf("cacl: denied %s for token %016llx\n", op,
 		    (unsigned long long)token);
@@ -701,6 +782,7 @@ cacl_pipe_init_label(struct label *label)
 	acl = malloc(sizeof(*acl), M_CACL, M_WAITOK);
 	cacl_acl_init(acl);
 	SLOT_SET(label, acl);
+	atomic_add_64(&cacl_stat_acls_created, 1);
 }
 
 static void
@@ -728,6 +810,7 @@ cacl_socket_init_label(struct label *label, int flag __unused)
 	acl = malloc(sizeof(*acl), M_CACL, M_WAITOK);
 	cacl_acl_init(acl);
 	SLOT_SET(label, acl);
+	atomic_add_64(&cacl_stat_acls_created, 1);
 	return (0);
 }
 
@@ -919,6 +1002,7 @@ cacl_posixshm_init_label(struct label *label)
 	acl = malloc(sizeof(*acl), M_CACL, M_WAITOK);
 	cacl_acl_init(acl);
 	SLOT_SET(label, acl);
+	atomic_add_64(&cacl_stat_acls_created, 1);
 }
 
 static void
@@ -1150,6 +1234,7 @@ cacl_vnode_alloc_acl(struct vnode *vp)
 	}
 
 	SLOT_SET(vp->v_label, acl);
+	atomic_add_64(&cacl_stat_acls_created, 1);
 	return (acl);
 }
 
@@ -1240,78 +1325,12 @@ cacl_token_for_procdesc(struct thread *td, int fd)
  * Ioctl Implementation
  * ======================================================================== */
 
-static int
-cacl_ioctl_add(struct thread *td, struct cacl_members *cm)
-{
-	struct file *capfp;
-	struct cacl_acl *acl;
-	uint64_t token;
-	int error = 0;
-	int i, j;
-
-	if (cm->cm_cap_count == 0 || cm->cm_proc_count == 0)
-		return (EINVAL);
-	if (cm->cm_cap_count > CACL_MAX_FDS ||
-	    cm->cm_proc_count > CACL_MAX_FDS)
-		return (EINVAL);
-
-	/* For each cap fd, add all proc tokens. */
-	for (i = 0; i < cm->cm_cap_count; i++) {
-		int capfd;
-
-		error = copyin(&cm->cm_cap_fds[i], &capfd, sizeof(capfd));
-		if (error != 0)
-			return (error);
-
-		error = fget(td, capfd, &cap_no_rights, &capfp);
-		if (error != 0)
-			return (error);
-
-		acl = cacl_acl_for_file(capfp, 1, NULL);
-		if (acl == NULL) {
-			fdrop(capfp, td);
-			return (EOPNOTSUPP);
-		}
-
-		sx_xlock(&acl->al_lock);
-
-		for (j = 0; j < cm->cm_proc_count; j++) {
-			int procfd;
-
-			error = copyin(&cm->cm_proc_fds[j], &procfd,
-			    sizeof(procfd));
-			if (error != 0)
-				break;
-
-			token = cacl_token_for_procdesc(td, procfd);
-			if (token == 0) {
-				error = EINVAL;
-				break;
-			}
-
-			error = cacl_acl_add(acl, token, 0);
-			if (error != 0)
-				break;
-		}
-
-		sx_xunlock(&acl->al_lock);
-		fdrop(capfp, td);
-
-		if (error != 0)
-			break;
-	}
-
-	if (error == 0)
-		SDT_PROBE1(cacl, , , acl__modify, "add");
-	return (error);
-}
-
 /*
- * Add processes to access lists with auto-cleanup flag.
+ * Add processes to access lists with auto-cleanup.
  * Entries are automatically removed when no process holds the token.
  */
 static int
-cacl_ioctl_add_auto(struct thread *td, struct cacl_members *cm)
+cacl_ioctl_add(struct thread *td, struct cacl_members *cm)
 {
 	struct file *capfp;
 	struct cacl_acl *acl;
@@ -1359,7 +1378,7 @@ cacl_ioctl_add_auto(struct thread *td, struct cacl_members *cm)
 				break;
 			}
 
-			error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP);
+			error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP, 0);
 			if (error != 0)
 				break;
 		}
@@ -1372,73 +1391,16 @@ cacl_ioctl_add_auto(struct thread *td, struct cacl_members *cm)
 	}
 
 	if (error == 0)
-		SDT_PROBE1(cacl, , , acl__modify, "add_auto");
-	return (error);
-}
-
-static int
-cacl_ioctl_add_self(struct thread *td, struct cacl_fds *cf)
-{
-	struct file *capfp;
-	struct cacl_acl *acl;
-	struct cacl_cred *cc;
-	uint64_t token;
-	int error = 0;
-	int i;
-
-	if (cf->cf_cap_count == 0)
-		return (EINVAL);
-	if (cf->cf_cap_count > CACL_MAX_FDS)
-		return (EINVAL);
-
-	/* Get caller's token. */
-	cc = cacl_cred_label(td->td_ucred);
-	if (cc == NULL)
-		return (EINVAL);
-	token = cc->cc_token;
-	if (token == 0)
-		return (EINVAL);
-
-	/* Add to each cap fd. */
-	for (i = 0; i < cf->cf_cap_count; i++) {
-		int capfd;
-
-		error = copyin(&cf->cf_cap_fds[i], &capfd, sizeof(capfd));
-		if (error != 0)
-			return (error);
-
-		error = fget(td, capfd, &cap_no_rights, &capfp);
-		if (error != 0)
-			return (error);
-
-		acl = cacl_acl_for_file(capfp, 1, NULL);
-		if (acl == NULL) {
-			fdrop(capfp, td);
-			return (EOPNOTSUPP);
-		}
-
-		sx_xlock(&acl->al_lock);
-		error = cacl_acl_add(acl, token, 0);
-		sx_xunlock(&acl->al_lock);
-
-		fdrop(capfp, td);
-
-		if (error != 0)
-			break;
-	}
-
-	if (error == 0)
-		SDT_PROBE1(cacl, , , acl__modify, "add_self");
+		SDT_PROBE1(cacl, , , acl__modify, "add");
 	return (error);
 }
 
 /*
- * Add calling process to access lists with auto-cleanup flag.
- * When no process holds this token anymore (all exited or exec'd),
- * the entry will be automatically removed during lazy cleanup.
+ * Add calling process to access lists with auto-cleanup.
+ * Entry is automatically removed when no process holds this token.
  */
 static int
-cacl_ioctl_add_self_auto(struct thread *td, struct cacl_fds *cf)
+cacl_ioctl_add_self(struct thread *td, struct cacl_fds *cf)
 {
 	struct file *capfp;
 	struct cacl_acl *acl;
@@ -1479,7 +1441,7 @@ cacl_ioctl_add_self_auto(struct thread *td, struct cacl_fds *cf)
 		}
 
 		sx_xlock(&acl->al_lock);
-		error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP);
+		error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP, 0);
 		sx_xunlock(&acl->al_lock);
 
 		fdrop(capfp, td);
@@ -1489,7 +1451,147 @@ cacl_ioctl_add_self_auto(struct thread *td, struct cacl_fds *cf)
 	}
 
 	if (error == 0)
-		SDT_PROBE1(cacl, , , acl__modify, "add_self_auto");
+		SDT_PROBE1(cacl, , , acl__modify, "add_self");
+	return (error);
+}
+
+/*
+ * Add processes to access lists with expiry timeout.
+ * Entries are automatically removed after the timeout.
+ */
+static int
+cacl_ioctl_add_timed(struct thread *td, struct cacl_members_timed *cmt)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	uint64_t token;
+	time_t expires;
+	int error = 0;
+	int i, j;
+
+	if (cmt->cmt_cap_count == 0 || cmt->cmt_proc_count == 0)
+		return (EINVAL);
+	if (cmt->cmt_cap_count > CACL_MAX_FDS ||
+	    cmt->cmt_proc_count > CACL_MAX_FDS)
+		return (EINVAL);
+	if (cmt->cmt_timeout_sec == 0)
+		return (EINVAL);  /* Use regular ADD for no timeout */
+
+	expires = time_second + cmt->cmt_timeout_sec;
+
+	/* For each cap fd, add all proc tokens with expiry. */
+	for (i = 0; i < cmt->cmt_cap_count; i++) {
+		int capfd;
+
+		error = copyin(&cmt->cmt_cap_fds[i], &capfd, sizeof(capfd));
+		if (error != 0)
+			return (error);
+
+		error = fget(td, capfd, &cap_no_rights, &capfp);
+		if (error != 0)
+			return (error);
+
+		acl = cacl_acl_for_file(capfp, 1, NULL);
+		if (acl == NULL) {
+			fdrop(capfp, td);
+			return (EOPNOTSUPP);
+		}
+
+		sx_xlock(&acl->al_lock);
+
+		for (j = 0; j < cmt->cmt_proc_count; j++) {
+			int procfd;
+
+			error = copyin(&cmt->cmt_proc_fds[j], &procfd,
+			    sizeof(procfd));
+			if (error != 0)
+				break;
+
+			token = cacl_token_for_procdesc(td, procfd);
+			if (token == 0) {
+				error = EINVAL;
+				break;
+			}
+
+			error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP,
+			    expires);
+			if (error != 0)
+				break;
+		}
+
+		sx_xunlock(&acl->al_lock);
+		fdrop(capfp, td);
+
+		if (error != 0)
+			break;
+	}
+
+	if (error == 0)
+		SDT_PROBE1(cacl, , , acl__modify, "add_timed");
+	return (error);
+}
+
+/*
+ * Add calling process to access lists with expiry timeout.
+ */
+static int
+cacl_ioctl_add_self_timed(struct thread *td, struct cacl_fds_timed *cft)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	struct cacl_cred *cc;
+	uint64_t token;
+	time_t expires;
+	int error = 0;
+	int i;
+
+	if (cft->cft_cap_count == 0)
+		return (EINVAL);
+	if (cft->cft_cap_count > CACL_MAX_FDS)
+		return (EINVAL);
+	if (cft->cft_timeout_sec == 0)
+		return (EINVAL);  /* Use regular ADD_SELF for no timeout */
+
+	/* Get caller's token. */
+	cc = cacl_cred_label(td->td_ucred);
+	if (cc == NULL)
+		return (EINVAL);
+	token = cc->cc_token;
+	if (token == 0)
+		return (EINVAL);
+
+	expires = time_second + cft->cft_timeout_sec;
+
+	/* Add to each cap fd with expiry. */
+	for (i = 0; i < cft->cft_cap_count; i++) {
+		int capfd;
+
+		error = copyin(&cft->cft_cap_fds[i], &capfd, sizeof(capfd));
+		if (error != 0)
+			return (error);
+
+		error = fget(td, capfd, &cap_no_rights, &capfp);
+		if (error != 0)
+			return (error);
+
+		acl = cacl_acl_for_file(capfp, 1, NULL);
+		if (acl == NULL) {
+			fdrop(capfp, td);
+			return (EOPNOTSUPP);
+		}
+
+		sx_xlock(&acl->al_lock);
+		error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP, expires);
+		sx_xunlock(&acl->al_lock);
+
+		fdrop(capfp, td);
+
+		if (error != 0)
+			break;
+	}
+
+	if (error == 0)
+		SDT_PROBE1(cacl, , , acl__modify, "add_self_timed");
 	return (error);
 }
 
@@ -1561,6 +1663,66 @@ cacl_ioctl_remove(struct thread *td, struct cacl_members *cm)
 
 	if (error == 0)
 		SDT_PROBE1(cacl, , , acl__modify, "remove");
+	return (error);
+}
+
+static int
+cacl_ioctl_remove_self(struct thread *td, struct cacl_fds *cf)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	struct cacl_cred *cc;
+	uint64_t token;
+	int error = 0;
+	int i;
+
+	if (cf->cf_cap_count == 0)
+		return (EINVAL);
+	if (cf->cf_cap_count > CACL_MAX_FDS)
+		return (EINVAL);
+
+	/* Get caller's token. */
+	cc = cacl_cred_label(td->td_ucred);
+	if (cc == NULL)
+		return (EINVAL);
+	token = cc->cc_token;
+	if (token == 0)
+		return (EINVAL);
+
+	/* Remove from each cap fd. */
+	for (i = 0; i < cf->cf_cap_count; i++) {
+		int capfd;
+
+		error = copyin(&cf->cf_cap_fds[i], &capfd, sizeof(capfd));
+		if (error != 0)
+			return (error);
+
+		error = fget(td, capfd, &cap_no_rights, &capfp);
+		if (error != 0)
+			return (error);
+
+		int supported;
+		acl = cacl_acl_for_file(capfp, 0, &supported);
+		if (!supported) {
+			fdrop(capfp, td);
+			return (EOPNOTSUPP);
+		}
+		if (acl == NULL) {
+			/* Supported type but no ACL = nothing to remove. */
+			fdrop(capfp, td);
+			continue;
+		}
+
+		sx_xlock(&acl->al_lock);
+		/* Ignore ENOENT - token might not be in list. */
+		(void)cacl_acl_remove(acl, token);
+		sx_xunlock(&acl->al_lock);
+
+		fdrop(capfp, td);
+	}
+
+	if (error == 0)
+		SDT_PROBE1(cacl, , , acl__modify, "remove_self");
 	return (error);
 }
 
@@ -1696,6 +1858,41 @@ cacl_ioctl_query(struct thread *td, struct cacl_query *cq)
 	return (0);
 }
 
+static int
+cacl_ioctl_count(struct thread *td, struct cacl_count *cc)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	int error;
+	int supported;
+
+	error = fget(td, cc->cc_cap_fd, &cap_no_rights, &capfp);
+	if (error != 0)
+		return (error);
+
+	acl = cacl_acl_for_file(capfp, 0, &supported);
+	if (!supported) {
+		fdrop(capfp, td);
+		return (EOPNOTSUPP);
+	}
+
+	/* No ACL means empty list. */
+	if (acl == NULL) {
+		cc->cc_count = 0;
+		cc->cc_locked = 0;
+		fdrop(capfp, td);
+		return (0);
+	}
+
+	sx_slock(&acl->al_lock);
+	cc->cc_count = acl->al_count;
+	cc->cc_locked = acl->al_locked;
+	sx_sunlock(&acl->al_lock);
+
+	fdrop(capfp, td);
+	return (0);
+}
+
 /* ========================================================================
  * Character Device
  * ======================================================================== */
@@ -1709,17 +1906,22 @@ cacl_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 	case CACL_IOC_ADD:
 		return (cacl_ioctl_add(td, (struct cacl_members *)data));
 
-	case CACL_IOC_ADD_AUTO:
-		return (cacl_ioctl_add_auto(td, (struct cacl_members *)data));
-
 	case CACL_IOC_ADD_SELF:
 		return (cacl_ioctl_add_self(td, (struct cacl_fds *)data));
 
-	case CACL_IOC_ADD_SELF_AUTO:
-		return (cacl_ioctl_add_self_auto(td, (struct cacl_fds *)data));
+	case CACL_IOC_ADD_TIMED:
+		return (cacl_ioctl_add_timed(td,
+		    (struct cacl_members_timed *)data));
+
+	case CACL_IOC_ADD_SELF_TIMED:
+		return (cacl_ioctl_add_self_timed(td,
+		    (struct cacl_fds_timed *)data));
 
 	case CACL_IOC_REMOVE:
 		return (cacl_ioctl_remove(td, (struct cacl_members *)data));
+
+	case CACL_IOC_REMOVE_SELF:
+		return (cacl_ioctl_remove_self(td, (struct cacl_fds *)data));
 
 	case CACL_IOC_CLEAR:
 		return (cacl_ioctl_clear(td, (struct cacl_fds *)data));
@@ -1729,6 +1931,9 @@ cacl_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 
 	case CACL_IOC_QUERY:
 		return (cacl_ioctl_query(td, (struct cacl_query *)data));
+
+	case CACL_IOC_COUNT:
+		return (cacl_ioctl_count(td, (struct cacl_count *)data));
 
 	default:
 		return (ENOTTY);
