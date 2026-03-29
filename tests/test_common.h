@@ -126,6 +126,23 @@ cacl_add(int cacl_fd, int *cap_fds, int cap_count,
 }
 
 /*
+ * Helper to add processes to a capability's access list with auto-cleanup.
+ * Entries are automatically removed when no process holds the token.
+ */
+static inline int
+cacl_add_auto(int cacl_fd, int *cap_fds, int cap_count,
+    int *proc_fds, int proc_count)
+{
+	struct cacl_members cm;
+
+	cm.cm_cap_fds = cap_fds;
+	cm.cm_cap_count = cap_count;
+	cm.cm_proc_fds = proc_fds;
+	cm.cm_proc_count = proc_count;
+	return (ioctl(cacl_fd, CACL_IOC_ADD_AUTO, &cm));
+}
+
+/*
  * Helper to remove processes from a capability's access list.
  */
 static inline int

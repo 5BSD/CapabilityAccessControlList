@@ -1306,6 +1306,76 @@ cacl_ioctl_add(struct thread *td, struct cacl_members *cm)
 	return (error);
 }
 
+/*
+ * Add processes to access lists with auto-cleanup flag.
+ * Entries are automatically removed when no process holds the token.
+ */
+static int
+cacl_ioctl_add_auto(struct thread *td, struct cacl_members *cm)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	uint64_t token;
+	int error = 0;
+	int i, j;
+
+	if (cm->cm_cap_count == 0 || cm->cm_proc_count == 0)
+		return (EINVAL);
+	if (cm->cm_cap_count > CACL_MAX_FDS ||
+	    cm->cm_proc_count > CACL_MAX_FDS)
+		return (EINVAL);
+
+	/* For each cap fd, add all proc tokens with auto-cleanup. */
+	for (i = 0; i < cm->cm_cap_count; i++) {
+		int capfd;
+
+		error = copyin(&cm->cm_cap_fds[i], &capfd, sizeof(capfd));
+		if (error != 0)
+			return (error);
+
+		error = fget(td, capfd, &cap_no_rights, &capfp);
+		if (error != 0)
+			return (error);
+
+		acl = cacl_acl_for_file(capfp, 1, NULL);
+		if (acl == NULL) {
+			fdrop(capfp, td);
+			return (EOPNOTSUPP);
+		}
+
+		sx_xlock(&acl->al_lock);
+
+		for (j = 0; j < cm->cm_proc_count; j++) {
+			int procfd;
+
+			error = copyin(&cm->cm_proc_fds[j], &procfd,
+			    sizeof(procfd));
+			if (error != 0)
+				break;
+
+			token = cacl_token_for_procdesc(td, procfd);
+			if (token == 0) {
+				error = EINVAL;
+				break;
+			}
+
+			error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP);
+			if (error != 0)
+				break;
+		}
+
+		sx_xunlock(&acl->al_lock);
+		fdrop(capfp, td);
+
+		if (error != 0)
+			break;
+	}
+
+	if (error == 0)
+		SDT_PROBE1(cacl, , , acl__modify, "add_auto");
+	return (error);
+}
+
 static int
 cacl_ioctl_add_self(struct thread *td, struct cacl_fds *cf)
 {
@@ -1638,6 +1708,9 @@ cacl_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 	switch (cmd) {
 	case CACL_IOC_ADD:
 		return (cacl_ioctl_add(td, (struct cacl_members *)data));
+
+	case CACL_IOC_ADD_AUTO:
+		return (cacl_ioctl_add_auto(td, (struct cacl_members *)data));
 
 	case CACL_IOC_ADD_SELF:
 		return (cacl_ioctl_add_self(td, (struct cacl_fds *)data));

@@ -672,6 +672,249 @@ test_auto_cleanup_entry_removed(void)
 	PASS();
 }
 
+/*
+ * Test: Supervisor adds child with ADD_AUTO, child exits, entry cleaned.
+ *
+ * This tests the CACL_IOC_ADD_AUTO ioctl which allows a supervisor to
+ * add a child process (by process descriptor) with auto-cleanup.
+ *
+ * 1. Parent creates pipe, forks child with pdfork
+ * 2. Child execs test_helper (gets unique token)
+ * 3. Parent adds child to ACL using ADD_AUTO
+ * 4. Child writes to pipe - should succeed
+ * 5. Child exits, token refcount drops to 0
+ * 6. Parent triggers cleanup, entry is removed
+ * 7. Pipe returns to default-allow
+ */
+static int
+test_add_auto_supervisor(void)
+{
+	int cacl_fd, pipe_r, pipe_w;
+	int proc_fd;
+	pid_t pid;
+	int ret, status;
+	int sync_pipe[2];
+	char buf[8];
+
+	signal(SIGPIPE, SIG_IGN);
+
+	cacl_fd = cacl_open();
+	if (cacl_fd < 0)
+		return (TEST_SKIP);
+
+	ret = create_pipe(&pipe_r, &pipe_w);
+	ASSERT(ret == 0, "create_pipe failed");
+
+	ret = pipe(sync_pipe);
+	ASSERT(ret == 0, "sync_pipe failed");
+
+	/* Use pdfork to get process descriptor. */
+	pid = pdfork(&proc_fd, 0);
+	ASSERT(pid >= 0, "pdfork failed");
+
+	if (pid == 0) {
+		/* Child: exec to get unique token, then wait for signal. */
+		close(pipe_r);
+		close(sync_pipe[1]);
+		close(cacl_fd);
+
+		/*
+		 * Carefully set up fds 3 and 4 for test_helper.
+		 * Only close originals if they differ from targets.
+		 */
+		if (pipe_w != 3) {
+			if (dup2(pipe_w, 3) < 0)
+				_exit(10);
+			close(pipe_w);
+		}
+		if (sync_pipe[0] != 4) {
+			if (dup2(sync_pipe[0], 4) < 0)
+				_exit(11);
+			close(sync_pipe[0]);
+		}
+
+		/* Exec to get unique token, then write when signaled. */
+		execl("./test_helper", "test_helper", "write", "3", "4",
+		    (char *)NULL);
+		_exit(13);
+	}
+
+	close(sync_pipe[0]);
+
+	/* Give child time to exec. */
+	usleep(100000);
+
+	/* Parent adds self so we can read from pipe. */
+	ret = cacl_add_self(cacl_fd, &pipe_w, 1);
+	ASSERT_EQ(ret, 0, "cacl_add_self failed");
+
+	/* Add child using ADD_AUTO. */
+	ret = cacl_add_auto(cacl_fd, &pipe_w, 1, &proc_fd, 1);
+	ASSERT_EQ(ret, 0, "cacl_add_auto failed");
+
+	/* Signal child to write. */
+	write(sync_pipe[1], "g", 1);
+	close(sync_pipe[1]);
+
+	/* Wait for child. */
+	waitpid(pid, &status, 0);
+	ASSERT(WIFEXITED(status), "child didn't exit normally");
+	ASSERT_EQ(WEXITSTATUS(status), 1, "child write should succeed");
+
+	/* Read what child wrote. */
+	ret = read(pipe_r, buf, 1);
+	ASSERT_EQ(ret, 1, "should have received child's write");
+
+	/* Child has exited. Its token refcount is now 0.
+	 * Parent's entry is regular (no auto-cleanup).
+	 * Child's entry should be cleaned up on next access. */
+
+	/* Trigger cleanup by parent accessing pipe. */
+	ret = write(pipe_w, "p", 1);
+	ASSERT_EQ(ret, 1, "parent write should succeed");
+
+	/* Drain. */
+	read(pipe_r, buf, 1);
+
+	close(proc_fd);
+	close(pipe_r);
+	close(pipe_w);
+	close(cacl_fd);
+
+	PASS();
+}
+
+/*
+ * Test: ADD_AUTO entry cleaned up allows new process to access.
+ *
+ * 1. Parent adds child1 with ADD_AUTO
+ * 2. Child1 can access
+ * 3. Child1 exits (entry cleaned)
+ * 4. Fork child2 (doesn't exec, so no entry for it)
+ * 5. Child2 can access (default-allow after cleanup)
+ */
+static int
+test_add_auto_cleanup_allows_new_access(void)
+{
+	int cacl_fd, pipe_r, pipe_w;
+	int proc_fd;
+	pid_t pid1, pid2;
+	int ret, status;
+	int sync_pipe[2];
+	char buf[8];
+
+	signal(SIGPIPE, SIG_IGN);
+
+	cacl_fd = cacl_open();
+	if (cacl_fd < 0)
+		return (TEST_SKIP);
+
+	ret = create_pipe(&pipe_r, &pipe_w);
+	ASSERT(ret == 0, "create_pipe failed");
+
+	ret = pipe(sync_pipe);
+	ASSERT(ret == 0, "sync_pipe failed");
+
+	/* Child1: will be added with ADD_AUTO. */
+	pid1 = pdfork(&proc_fd, 0);
+	ASSERT(pid1 >= 0, "pdfork failed");
+
+	if (pid1 == 0) {
+		close(pipe_r);
+		close(sync_pipe[1]);
+		close(cacl_fd);
+
+		/*
+		 * Carefully set up fds 3 and 4 for test_helper.
+		 * Only close originals if they differ from targets.
+		 */
+		if (pipe_w != 3) {
+			if (dup2(pipe_w, 3) < 0)
+				_exit(10);
+			close(pipe_w);
+		}
+		if (sync_pipe[0] != 4) {
+			if (dup2(sync_pipe[0], 4) < 0)
+				_exit(11);
+			close(sync_pipe[0]);
+		}
+
+		execl("./test_helper", "test_helper", "write", "3", "4",
+		    (char *)NULL);
+		_exit(12);
+	}
+
+	close(sync_pipe[0]);
+	usleep(100000);
+
+	/* Add child1 with ADD_AUTO (only entry in ACL). */
+	ret = cacl_add_auto(cacl_fd, &pipe_w, 1, &proc_fd, 1);
+	ASSERT_EQ(ret, 0, "cacl_add_auto failed");
+
+	/* Signal child1 to write and exit. */
+	write(sync_pipe[1], "g", 1);
+	close(sync_pipe[1]);
+
+	waitpid(pid1, &status, 0);
+	ASSERT(WIFEXITED(status), "child1 didn't exit normally");
+	ASSERT_EQ(WEXITSTATUS(status), 1, "child1 write should succeed");
+
+	/* Drain child1's write. */
+	read(pipe_r, buf, 1);
+
+	close(proc_fd);
+
+	/* Child1 has exited. Its entry should be cleaned up.
+	 * ACL should be empty = default-allow. */
+
+	/* Fork child2 (no exec, inherits parent token which isn't in ACL). */
+	ret = pipe(sync_pipe);
+	ASSERT(ret == 0, "sync_pipe2 failed");
+
+	pid2 = fork();
+	ASSERT(pid2 >= 0, "fork2 failed");
+
+	if (pid2 == 0) {
+		close(pipe_r);
+		close(sync_pipe[1]);
+
+		read(sync_pipe[0], buf, 1);
+		close(sync_pipe[0]);
+
+		/* Try to write - should succeed (cleanup made it default-allow). */
+		ret = write(pipe_w, "2", 1);
+		close(pipe_w);
+		close(cacl_fd);
+
+		if (ret == 1)
+			_exit(0);
+		else if (errno == EACCES)
+			_exit(1);
+		else
+			_exit(2);
+	}
+
+	close(sync_pipe[0]);
+
+	/* Signal child2 to write. */
+	write(sync_pipe[1], "g", 1);
+	close(sync_pipe[1]);
+
+	waitpid(pid2, &status, 0);
+	ASSERT(WIFEXITED(status), "child2 didn't exit normally");
+	ASSERT_EQ(WEXITSTATUS(status), 0,
+	    "child2 should succeed (ACL empty after cleanup)");
+
+	/* Drain. */
+	read(pipe_r, buf, 1);
+
+	close(pipe_r);
+	close(pipe_w);
+	close(cacl_fd);
+
+	PASS();
+}
+
 int
 main(void)
 {
@@ -704,6 +947,14 @@ main(void)
 		return (ret);
 
 	ret = test_auto_cleanup_entry_removed();
+	if (ret != TEST_PASS)
+		return (ret);
+
+	ret = test_add_auto_supervisor();
+	if (ret != TEST_PASS)
+		return (ret);
+
+	ret = test_add_auto_cleanup_allows_new_access();
 	if (ret != TEST_PASS)
 		return (ret);
 

@@ -17,7 +17,7 @@
  */
 
 /*
- * Used by CACL_IOC_ADD and CACL_IOC_REMOVE.
+ * Used by CACL_IOC_ADD, CACL_IOC_ADD_AUTO, and CACL_IOC_REMOVE.
  * Adds or removes processes (by process descriptor) to/from access lists
  * on the specified capability file descriptors.
  */
@@ -58,6 +58,12 @@ struct cacl_query {
 
 /* Add processes (by proc descriptor) to access lists. Creates list if needed. */
 #define	CACL_IOC_ADD		_IOW('L', 1, struct cacl_members)
+
+/*
+ * Add processes (by proc descriptor) to access lists with auto-cleanup.
+ * Entries are automatically removed when no process holds the token.
+ */
+#define	CACL_IOC_ADD_AUTO	_IOW('L', 8, struct cacl_members)
 
 /* Add calling process to access lists. Creates list if needed. */
 #define	CACL_IOC_ADD_SELF	_IOW('L', 2, struct cacl_fds)
