@@ -9,6 +9,7 @@ TESTS="
 	test_add_self
 	test_add
 	test_remove
+	test_remove_self
 	test_clear
 	test_exec
 	test_fork
@@ -26,6 +27,7 @@ TESTS="
 	test_comprehensive
 	test_lock_query
 	test_auto_cleanup
+	test_timed
 "
 
 # Colors for output (use printf to interpret escapes)

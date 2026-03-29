@@ -1,0 +1,260 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026
+.\"
+.Dd March 28, 2026
+.Dt CACL 4
+.Os
+.Sh NAME
+.Nm cacl
+.Nd Capability Access Control List device
+.Sh SYNOPSIS
+.In sys/ioctl.h
+.In cacl.h
+.Pp
+.Fd #include <fcntl.h>
+.Ft int
+.Fn open "/dev/cacl" "O_RDWR"
+.Sh DESCRIPTION
+The
+.Nm
+device provides a mechanism for attaching Access Control Lists (ACLs)
+to file descriptors.
+When an ACL is attached to a descriptor, only processes whose tokens
+appear in the ACL may perform operations on that descriptor.
+.Pp
+Each process has a unique 64-bit token that is randomly generated at
+.Xr exec 2 .
+Tokens are inherited across
+.Xr fork 2
+but change on
+.Xr exec 2 ,
+providing compartmentalization for sandboxed child processes.
+.Pp
+ACL entries are automatically cleaned up when no process holds the
+associated token (all have exited or called
+.Xr exec 2 ) .
+.Ss Supported Descriptor Types
+.Bl -bullet -compact
+.It
+Pipes
+.Pq Xr pipe 2
+.It
+Sockets
+.Pq Xr socket 2 , Xr socketpair 2
+.It
+POSIX shared memory
+.Pq Xr shm_open 2
+.It
+Regular files and FIFOs
+.Pq Xr open 2
+.El
+.Ss ACL States
+A descriptor can be in one of three states:
+.Bl -tag -width "default-allow"
+.It Em default-allow
+No ACL attached.
+All processes may access the descriptor.
+This is the initial state.
+.It Em ACL active
+An ACL is attached with one or more entries.
+Only processes with matching tokens may access the descriptor.
+.It Em locked
+The ACL is locked (deny-all mode).
+No processes may access the descriptor regardless of token.
+.El
+.Sh IOCTLS
+The following
+.Xr ioctl 2
+commands are supported on the
+.Pa /dev/cacl
+device:
+.Bl -tag -width CACL_IOC_ADD_SELF_TIMED
+.It Dv CACL_IOC_ADD
+Add processes (by process descriptor) to access lists.
+Takes a
+.Vt struct cacl_members
+argument.
+.It Dv CACL_IOC_ADD_SELF
+Add the calling process to access lists.
+Takes a
+.Vt struct cacl_fds
+argument.
+.It Dv CACL_IOC_REMOVE
+Remove processes (by process descriptor) from access lists.
+Takes a
+.Vt struct cacl_members
+argument.
+.It Dv CACL_IOC_REMOVE_SELF
+Remove the calling process from access lists.
+Takes a
+.Vt struct cacl_fds
+argument.
+.It Dv CACL_IOC_CLEAR
+Clear all entries from access lists, returning to default-allow.
+Takes a
+.Vt struct cacl_fds
+argument.
+.It Dv CACL_IOC_LOCK
+Lock access lists in deny-all mode.
+Takes a
+.Vt struct cacl_fds
+argument.
+.It Dv CACL_IOC_QUERY
+Query if a process is in an access list.
+Takes a
+.Vt struct cacl_query
+argument.
+.It Dv CACL_IOC_COUNT
+Count entries in an access list.
+Takes a
+.Vt struct cacl_count
+argument.
+.It Dv CACL_IOC_ADD_TIMED
+Add processes with expiry timeout.
+Entries are removed after the specified seconds OR when no process
+holds the token.
+Takes a
+.Vt struct cacl_members_timed
+argument.
+.It Dv CACL_IOC_ADD_SELF_TIMED
+Add the calling process with expiry timeout.
+Takes a
+.Vt struct cacl_fds_timed
+argument.
+.El
+.Sh DATA STRUCTURES
+.Bd -literal
+struct cacl_members {
+    int      *cm_cap_fds;     /* descriptors to modify */
+    uint16_t  cm_cap_count;   /* number of descriptors */
+    int      *cm_proc_fds;    /* process descriptors */
+    uint16_t  cm_proc_count;  /* number of processes */
+};
+
+struct cacl_fds {
+    int      *cf_cap_fds;     /* descriptors to modify */
+    uint16_t  cf_cap_count;   /* number of descriptors */
+};
+
+struct cacl_query {
+    int       cq_cap_fd;      /* descriptor to check */
+    int       cq_proc_fd;     /* process to check */
+    int       cq_result;      /* output: 1=member, 0=not */
+};
+
+struct cacl_count {
+    int       cc_cap_fd;      /* descriptor to query */
+    uint32_t  cc_count;       /* output: entry count */
+    int       cc_locked;      /* output: 1=locked, 0=not */
+};
+
+struct cacl_members_timed {
+    int      *cmt_cap_fds;    /* descriptors to modify */
+    uint16_t  cmt_cap_count;  /* number of descriptors */
+    int      *cmt_proc_fds;   /* process descriptors */
+    uint16_t  cmt_proc_count; /* number of processes */
+    uint32_t  cmt_timeout_sec;/* expiry in seconds */
+};
+
+struct cacl_fds_timed {
+    int      *cft_cap_fds;    /* descriptors to modify */
+    uint16_t  cft_cap_count;  /* number of descriptors */
+    uint32_t  cft_timeout_sec;/* expiry in seconds */
+};
+.Ed
+.Sh EXAMPLES
+Add the calling process to a pipe's ACL:
+.Bd -literal -offset indent
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include "cacl.h"
+
+int cacl_fd, pipe_fd;
+struct cacl_fds cf;
+
+cacl_fd = open("/dev/cacl", O_RDWR);
+cf.cf_cap_fds = &pipe_fd;
+cf.cf_cap_count = 1;
+ioctl(cacl_fd, CACL_IOC_ADD_SELF, &cf);
+.Ed
+.Pp
+Add a child process with 60-second timeout:
+.Bd -literal -offset indent
+struct cacl_members_timed cmt;
+
+cmt.cmt_cap_fds = &pipe_fd;
+cmt.cmt_cap_count = 1;
+cmt.cmt_proc_fds = &child_pfd;
+cmt.cmt_proc_count = 1;
+cmt.cmt_timeout_sec = 60;
+ioctl(cacl_fd, CACL_IOC_ADD_TIMED, &cmt);
+.Ed
+.Sh SYSCTL VARIABLES
+The following
+.Xr sysctl 8
+variables are available:
+.Bl -tag -width "security.cacl.stat_auto_cleanups"
+.It Va security.cacl.verbose
+Enable verbose debug output (default: 0).
+.It Va security.cacl.stat_acls_created
+Number of ACLs created.
+.It Va security.cacl.stat_entries_added
+Number of entries added.
+.It Va security.cacl.stat_entries_removed
+Number of entries removed.
+.It Va security.cacl.stat_auto_cleanups
+Number of automatic cleanups performed.
+.It Va security.cacl.stat_access_denied
+Number of access denials.
+.It Va security.cacl.stat_access_allowed
+Number of access grants.
+.El
+.Sh ERRORS
+The
+.Nm
+ioctls may fail with:
+.Bl -tag -width Er
+.It Bq Er EBADF
+A file descriptor argument is invalid.
+.It Bq Er EINVAL
+Invalid argument (e.g., NULL pointer, zero count).
+.It Bq Er ENOMEM
+Insufficient kernel memory.
+.It Bq Er EPERM
+Operation not permitted (e.g., adding to locked ACL).
+.It Bq Er EOPNOTSUPP
+Descriptor type not supported.
+.El
+.Sh SEE ALSO
+.Xr capsicum 4 ,
+.Xr mac 4 ,
+.Xr pdfork 2 ,
+.Xr ioctl 2
+.Sh HISTORY
+The
+.Nm
+device first appeared in
+.Fx 15.0 .
+.Sh AUTHORS
+The
+.Nm
+module was written as an extension to Capsicum for fine-grained
+access control on shared descriptors.
+.Sh CAVEATS
+.Bl -bullet
+.It
+Path-based operations
+.Pq Xr open 2 , Xr stat 2
+bypass ACL checks; use
+.Xr cap_enter 2
+to prevent path-based access.
+.It
+The
+.Xr poll 2
+and
+.Xr select 2
+system calls currently cannot be denied by ACLs.
+.It
+ACL entries are limited to 65536 per descriptor.
+.El

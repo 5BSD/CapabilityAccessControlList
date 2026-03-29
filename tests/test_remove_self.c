@@ -182,6 +182,9 @@ test_count_locked(void)
 
 /*
  * Test: Count with multiple entries.
+ *
+ * Child must exec to get a unique token, otherwise it shares
+ * parent's token and adding it won't create a second entry.
  */
 static int
 test_count_multiple(void)
@@ -189,7 +192,7 @@ test_count_multiple(void)
 	int cacl_fd, pipe_r, pipe_w;
 	int proc_fd;
 	pid_t pid;
-	int ret;
+	int ret, status;
 	uint32_t count;
 	int locked;
 
@@ -208,16 +211,23 @@ test_count_multiple(void)
 	ASSERT_EQ(ret, 0, "cacl_count failed");
 	ASSERT_EQ(count, 1, "count should be 1");
 
-	/* Fork a child and add it. */
+	/* Fork a child that will exec to get unique token. */
 	pid = pdfork(&proc_fd, 0);
 	ASSERT(pid >= 0, "pdfork failed");
 
 	if (pid == 0) {
-		/* Child: just wait and exit. */
-		sleep(1);
-		_exit(0);
+		/* Child: exec to get unique token, then wait. */
+		close(pipe_r);
+		close(cacl_fd);
+		execl("./test_helper", "test_helper", "wait", "3",
+		    (char *)NULL);
+		_exit(10);
 	}
 
+	/* Give child time to exec. */
+	usleep(100000);
+
+	/* Add child (now has unique token after exec). */
 	ret = cacl_add(cacl_fd, &pipe_w, 1, &proc_fd, 1);
 	ASSERT_EQ(ret, 0, "cacl_add failed");
 
@@ -235,7 +245,7 @@ test_count_multiple(void)
 
 	/* Clean up. */
 	close(proc_fd);
-	waitpid(pid, NULL, 0);
+	waitpid(pid, &status, 0);
 	close(pipe_r);
 	close(pipe_w);
 	close(cacl_fd);
