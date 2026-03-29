@@ -78,10 +78,43 @@ SYSCTL_INT(_security, OID_AUTO, cacl_verbose, CTLFLAG_RW, &cacl_verbose, 0,
 #define	CACL_MAX_TOKENS	65536
 
 /*
+ * Token reference count hash table size (must be power of 2).
+ */
+#define	CACL_TOKEN_HASH_SIZE	256
+#define	CACL_TOKEN_HASH(t)	((t) & (CACL_TOKEN_HASH_SIZE - 1))
+
+/*
  * Label slot accessor macros.
  */
 #define	SLOT(l)		((void *)mac_label_get((l), cacl_slot))
 #define	SLOT_SET(l, v)	mac_label_set((l), cacl_slot, (intptr_t)(v))
+
+/*
+ * ACL entry flags.
+ */
+#define	CACL_ENTRY_AUTO_CLEANUP	0x01	/* remove when token refcount hits 0 */
+
+/*
+ * Token reference tracking.
+ * Tracks how many credentials currently hold each token.
+ * Used for lazy cleanup of auto_cleanup ACL entries.
+ */
+struct cacl_token_ref {
+	uint64_t		 tr_token;
+	uint32_t		 tr_refcount;
+	LIST_ENTRY(cacl_token_ref) tr_link;
+};
+
+static struct mtx cacl_token_mtx;
+static LIST_HEAD(, cacl_token_ref) cacl_token_hash[CACL_TOKEN_HASH_SIZE];
+
+/*
+ * ACL entry - token plus flags.
+ */
+struct cacl_entry {
+	uint64_t	 ce_token;	/* process token                */
+	uint8_t		 ce_flags;	/* CACL_ENTRY_* flags           */
+};
 
 /*
  * Access list structure - stored on object labels.
@@ -89,8 +122,8 @@ SYSCTL_INT(_security, OID_AUTO, cacl_verbose, CTLFLAG_RW, &cacl_verbose, 0,
  */
 struct cacl_acl {
 	struct sx	 al_lock;	/* protects list modifications  */
-	uint64_t	*al_tokens;	/* array of allowed tokens      */
-	uint32_t	 al_count;	/* number of tokens in list     */
+	struct cacl_entry *al_entries;	/* array of allowed entries     */
+	uint32_t	 al_count;	/* number of entries in list    */
 	uint32_t	 al_capacity;	/* allocated capacity           */
 	int		 al_locked;	/* if set, empty list = deny-all */
 };
@@ -117,7 +150,7 @@ static struct cdev *cacl_dev;
  */
 static void	cacl_acl_init(struct cacl_acl *acl);
 static void	cacl_acl_destroy(struct cacl_acl *acl);
-static int	cacl_acl_add(struct cacl_acl *acl, uint64_t token);
+static int	cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags);
 static int	cacl_acl_remove(struct cacl_acl *acl, uint64_t token);
 static void	cacl_acl_clear(struct cacl_acl *acl);
 static void	cacl_acl_lock(struct cacl_acl *acl);
@@ -125,6 +158,123 @@ static int	cacl_acl_contains(struct cacl_acl *acl, uint64_t token);
 static int	cacl_acl_check(struct cacl_acl *acl, uint64_t token,
 		    const char *op);
 static uint64_t	cacl_new_token(void);
+
+/* Token reference counting */
+static void	cacl_token_ref_init(void);
+static void	cacl_token_ref_inc(uint64_t token);
+static void	cacl_token_ref_dec(uint64_t token);
+static uint32_t	cacl_token_ref_get(uint64_t token);
+
+/* ========================================================================
+ * Token Reference Counting
+ *
+ * Tracks how many credentials currently hold each token. This is used
+ * for lazy cleanup: when an ACL entry has the AUTO_CLEANUP flag and
+ * its token's refcount reaches 0, the entry can be removed.
+ * ======================================================================== */
+
+static void
+cacl_token_ref_init(void)
+{
+	int i;
+
+	mtx_init(&cacl_token_mtx, "cacl_token", NULL, MTX_DEF);
+	for (i = 0; i < CACL_TOKEN_HASH_SIZE; i++)
+		LIST_INIT(&cacl_token_hash[i]);
+}
+
+/*
+ * Increment reference count for a token.
+ * Creates entry if it doesn't exist.
+ */
+static void
+cacl_token_ref_inc(uint64_t token)
+{
+	struct cacl_token_ref *tr;
+	uint32_t hash;
+
+	if (token == 0)
+		return;
+
+	hash = CACL_TOKEN_HASH(token);
+	mtx_lock(&cacl_token_mtx);
+
+	LIST_FOREACH(tr, &cacl_token_hash[hash], tr_link) {
+		if (tr->tr_token == token) {
+			tr->tr_refcount++;
+			mtx_unlock(&cacl_token_mtx);
+			return;
+		}
+	}
+
+	/* Not found - create new entry. */
+	tr = malloc(sizeof(*tr), M_CACL, M_NOWAIT);
+	if (tr != NULL) {
+		tr->tr_token = token;
+		tr->tr_refcount = 1;
+		LIST_INSERT_HEAD(&cacl_token_hash[hash], tr, tr_link);
+	}
+	mtx_unlock(&cacl_token_mtx);
+}
+
+/*
+ * Decrement reference count for a token.
+ * Removes entry when refcount reaches 0.
+ */
+static void
+cacl_token_ref_dec(uint64_t token)
+{
+	struct cacl_token_ref *tr;
+	uint32_t hash;
+
+	if (token == 0)
+		return;
+
+	hash = CACL_TOKEN_HASH(token);
+	mtx_lock(&cacl_token_mtx);
+
+	LIST_FOREACH(tr, &cacl_token_hash[hash], tr_link) {
+		if (tr->tr_token == token) {
+			if (tr->tr_refcount > 0)
+				tr->tr_refcount--;
+			if (tr->tr_refcount == 0) {
+				LIST_REMOVE(tr, tr_link);
+				free(tr, M_CACL);
+			}
+			mtx_unlock(&cacl_token_mtx);
+			return;
+		}
+	}
+
+	mtx_unlock(&cacl_token_mtx);
+}
+
+/*
+ * Get current reference count for a token.
+ * Returns 0 if token not found (no credentials hold it).
+ */
+static uint32_t
+cacl_token_ref_get(uint64_t token)
+{
+	struct cacl_token_ref *tr;
+	uint32_t hash, refcount = 0;
+
+	if (token == 0)
+		return (0);
+
+	hash = CACL_TOKEN_HASH(token);
+	mtx_lock(&cacl_token_mtx);
+
+	LIST_FOREACH(tr, &cacl_token_hash[hash], tr_link) {
+		if (tr->tr_token == token) {
+			refcount = tr->tr_refcount;
+			break;
+		}
+	}
+
+	mtx_unlock(&cacl_token_mtx);
+	return (refcount);
+}
 
 /* ========================================================================
  * Access List Operations
@@ -135,7 +285,7 @@ cacl_acl_init(struct cacl_acl *acl)
 {
 
 	sx_init(&acl->al_lock, "cacl_acl");
-	acl->al_tokens = NULL;
+	acl->al_entries = NULL;
 	acl->al_count = 0;
 	acl->al_capacity = 0;
 	acl->al_locked = 0;
@@ -145,8 +295,8 @@ static void
 cacl_acl_destroy(struct cacl_acl *acl)
 {
 
-	if (acl->al_tokens != NULL)
-		free(acl->al_tokens, M_CACL);
+	if (acl->al_entries != NULL)
+		free(acl->al_entries, M_CACL);
 	sx_destroy(&acl->al_lock);
 }
 
@@ -156,17 +306,20 @@ cacl_acl_destroy(struct cacl_acl *acl)
  * Caller must hold al_lock exclusively.
  */
 static int
-cacl_acl_add(struct cacl_acl *acl, uint64_t token)
+cacl_acl_add(struct cacl_acl *acl, uint64_t token, uint8_t flags)
 {
-	uint64_t *newtokens;
+	struct cacl_entry *newentries;
 	uint32_t newcap;
 
 	sx_assert(&acl->al_lock, SX_XLOCKED);
 
 	/* Check if already present. */
 	for (uint32_t i = 0; i < acl->al_count; i++) {
-		if (acl->al_tokens[i] == token)
+		if (acl->al_entries[i].ce_token == token) {
+			/* Update flags if adding with different flags. */
+			acl->al_entries[i].ce_flags |= flags;
 			return (0);
+		}
 	}
 
 	/* Enforce maximum ACL size. */
@@ -179,18 +332,20 @@ cacl_acl_add(struct cacl_acl *acl, uint64_t token)
 		/* Clamp to max to avoid overflow. */
 		if (newcap > CACL_MAX_TOKENS)
 			newcap = CACL_MAX_TOKENS;
-		newtokens = malloc(newcap * sizeof(uint64_t), M_CACL,
+		newentries = malloc(newcap * sizeof(struct cacl_entry), M_CACL,
 		    M_WAITOK);
-		if (acl->al_tokens != NULL) {
-			memcpy(newtokens, acl->al_tokens,
-			    acl->al_count * sizeof(uint64_t));
-			free(acl->al_tokens, M_CACL);
+		if (acl->al_entries != NULL) {
+			memcpy(newentries, acl->al_entries,
+			    acl->al_count * sizeof(struct cacl_entry));
+			free(acl->al_entries, M_CACL);
 		}
-		acl->al_tokens = newtokens;
+		acl->al_entries = newentries;
 		acl->al_capacity = newcap;
 	}
 
-	acl->al_tokens[acl->al_count++] = token;
+	acl->al_entries[acl->al_count].ce_token = token;
+	acl->al_entries[acl->al_count].ce_flags = flags;
+	acl->al_count++;
 	return (0);
 }
 
@@ -205,9 +360,9 @@ cacl_acl_remove(struct cacl_acl *acl, uint64_t token)
 	sx_assert(&acl->al_lock, SX_XLOCKED);
 
 	for (uint32_t i = 0; i < acl->al_count; i++) {
-		if (acl->al_tokens[i] == token) {
+		if (acl->al_entries[i].ce_token == token) {
 			/* Swap with last and decrement count. */
-			acl->al_tokens[i] = acl->al_tokens[acl->al_count - 1];
+			acl->al_entries[i] = acl->al_entries[acl->al_count - 1];
 			acl->al_count--;
 			return (0);
 		}
@@ -252,10 +407,36 @@ cacl_acl_contains(struct cacl_acl *acl, uint64_t token)
 {
 
 	for (uint32_t i = 0; i < acl->al_count; i++) {
-		if (acl->al_tokens[i] == token)
+		if (acl->al_entries[i].ce_token == token)
 			return (1);
 	}
 	return (0);
+}
+
+/*
+ * Perform lazy cleanup of stale auto_cleanup entries.
+ * Removes entries where the token's refcount has dropped to 0.
+ * Caller must hold al_lock exclusively.
+ */
+static void
+cacl_acl_lazy_cleanup(struct cacl_acl *acl)
+{
+	uint32_t i;
+
+	sx_assert(&acl->al_lock, SX_XLOCKED);
+
+	i = 0;
+	while (i < acl->al_count) {
+		if ((acl->al_entries[i].ce_flags & CACL_ENTRY_AUTO_CLEANUP) &&
+		    cacl_token_ref_get(acl->al_entries[i].ce_token) == 0) {
+			/* Token is dead - remove entry. */
+			acl->al_entries[i] = acl->al_entries[acl->al_count - 1];
+			acl->al_count--;
+			/* Don't increment i - check swapped entry. */
+		} else {
+			i++;
+		}
+	}
 }
 
 /*
@@ -264,11 +445,13 @@ cacl_acl_contains(struct cacl_acl *acl, uint64_t token)
  * If acl is NULL (pre-existing object), returns 0 (default-allow).
  * If list is empty and not locked, returns 0 (default-allow).
  * If list is empty and locked, returns EACCES (deny-all).
+ * Performs lazy cleanup of stale auto_cleanup entries.
  * Fires DTrace probe on denial.
  */
 static int
 cacl_acl_check(struct cacl_acl *acl, uint64_t token, const char *op)
 {
+	int need_cleanup = 0;
 
 	/* NULL label means pre-existing object - allow. */
 	if (acl == NULL)
@@ -279,6 +462,22 @@ cacl_acl_check(struct cacl_acl *acl, uint64_t token, const char *op)
 		return (0);
 
 	sx_slock(&acl->al_lock);
+
+	/* Quick scan to see if lazy cleanup is needed. */
+	for (uint32_t i = 0; i < acl->al_count; i++) {
+		if (acl->al_entries[i].ce_flags & CACL_ENTRY_AUTO_CLEANUP) {
+			need_cleanup = 1;
+			break;
+		}
+	}
+
+	if (need_cleanup) {
+		/* Upgrade to exclusive lock for cleanup. */
+		sx_sunlock(&acl->al_lock);
+		sx_xlock(&acl->al_lock);
+		cacl_acl_lazy_cleanup(acl);
+		sx_downgrade(&acl->al_lock);
+	}
 
 	/* Empty list: check if locked (deny-all) or not (default-allow). */
 	if (acl->al_count == 0) {
@@ -294,7 +493,7 @@ cacl_acl_check(struct cacl_acl *acl, uint64_t token, const char *op)
 	}
 
 	for (uint32_t i = 0; i < acl->al_count; i++) {
-		if (acl->al_tokens[i] == token) {
+		if (acl->al_entries[i].ce_token == token) {
 			sx_sunlock(&acl->al_lock);
 			return (0);
 		}
@@ -392,8 +591,11 @@ cacl_cred_destroy_label(struct label *label)
 	struct cacl_cred *cc;
 
 	cc = SLOT(label);
-	if (cc != NULL)
+	if (cc != NULL) {
+		/* Decrement refcount for this token. */
+		cacl_token_ref_dec(cc->cc_token);
 		free(cc, M_CACL);
+	}
 	SLOT_SET(label, NULL);
 }
 
@@ -403,8 +605,10 @@ cacl_cred_create_init(struct ucred *cred)
 	struct cacl_cred *cc;
 
 	cc = cacl_cred_label(cred);
-	if (cc != NULL)
+	if (cc != NULL) {
 		cc->cc_token = cacl_new_token();
+		cacl_token_ref_inc(cc->cc_token);
+	}
 }
 
 static void
@@ -413,8 +617,10 @@ cacl_cred_create_swapper(struct ucred *cred)
 	struct cacl_cred *cc;
 
 	cc = cacl_cred_label(cred);
-	if (cc != NULL)
+	if (cc != NULL) {
 		cc->cc_token = cacl_new_token();
+		cacl_token_ref_inc(cc->cc_token);
+	}
 }
 
 static void
@@ -430,11 +636,13 @@ cacl_cred_copy_label(struct label *src, struct label *dest)
 		return;
 	if (scc == NULL) {
 		dcc->cc_token = cacl_new_token();
+		cacl_token_ref_inc(dcc->cc_token);
 		return;
 	}
 
-	/* Fork: child inherits parent's token. */
+	/* Fork: child inherits parent's token. Increment refcount. */
 	dcc->cc_token = scc->cc_token;
+	cacl_token_ref_inc(dcc->cc_token);
 }
 
 /*
@@ -456,6 +664,11 @@ cacl_execve_will_transition(struct ucred *old __unused,
  * Called during exec to transition credentials.
  * Assign a new token to the new credential so exec'd processes
  * cannot use the pre-exec process's access rights.
+ *
+ * Note: The new credential was created by copying from old, so
+ * cc_token was copied and its refcount was already incremented
+ * in cred_copy_label. We need to decrement that old token's
+ * refcount before assigning a new one.
  */
 static void
 cacl_execve_transition(struct ucred *old __unused, struct ucred *new,
@@ -467,7 +680,11 @@ cacl_execve_transition(struct ucred *old __unused, struct ucred *new,
 
 	cc = cacl_cred_label(new);
 	if (cc != NULL) {
+		/* Decrement refcount for the inherited token. */
+		cacl_token_ref_dec(cc->cc_token);
+		/* Assign new token and increment its refcount. */
 		cc->cc_token = cacl_new_token();
+		cacl_token_ref_inc(cc->cc_token);
 		SDT_PROBE1(cacl, , , token__change, cc->cc_token);
 	}
 }
@@ -886,6 +1103,11 @@ cacl_vnode_check_mmap(struct ucred *cred, struct vnode *vp,
 	return (cacl_acl_check(acl, token, "vnode_mmap"));
 }
 
+/*
+ * Note: MACF does not provide mpo_vnode_check_ioctl.
+ * Use Capsicum cap_ioctls_limit() for ioctl control on devices.
+ */
+
 /* ========================================================================
  * Ioctl Helpers
  * ======================================================================== */
@@ -1067,7 +1289,7 @@ cacl_ioctl_add(struct thread *td, struct cacl_members *cm)
 				break;
 			}
 
-			error = cacl_acl_add(acl, token);
+			error = cacl_acl_add(acl, token, 0);
 			if (error != 0)
 				break;
 		}
@@ -1126,7 +1348,7 @@ cacl_ioctl_add_self(struct thread *td, struct cacl_fds *cf)
 		}
 
 		sx_xlock(&acl->al_lock);
-		error = cacl_acl_add(acl, token);
+		error = cacl_acl_add(acl, token, 0);
 		sx_xunlock(&acl->al_lock);
 
 		fdrop(capfp, td);
@@ -1137,6 +1359,67 @@ cacl_ioctl_add_self(struct thread *td, struct cacl_fds *cf)
 
 	if (error == 0)
 		SDT_PROBE1(cacl, , , acl__modify, "add_self");
+	return (error);
+}
+
+/*
+ * Add calling process to access lists with auto-cleanup flag.
+ * When no process holds this token anymore (all exited or exec'd),
+ * the entry will be automatically removed during lazy cleanup.
+ */
+static int
+cacl_ioctl_add_self_auto(struct thread *td, struct cacl_fds *cf)
+{
+	struct file *capfp;
+	struct cacl_acl *acl;
+	struct cacl_cred *cc;
+	uint64_t token;
+	int error = 0;
+	int i;
+
+	if (cf->cf_cap_count == 0)
+		return (EINVAL);
+	if (cf->cf_cap_count > CACL_MAX_FDS)
+		return (EINVAL);
+
+	/* Get caller's token. */
+	cc = cacl_cred_label(td->td_ucred);
+	if (cc == NULL)
+		return (EINVAL);
+	token = cc->cc_token;
+	if (token == 0)
+		return (EINVAL);
+
+	/* Add to each cap fd with auto-cleanup flag. */
+	for (i = 0; i < cf->cf_cap_count; i++) {
+		int capfd;
+
+		error = copyin(&cf->cf_cap_fds[i], &capfd, sizeof(capfd));
+		if (error != 0)
+			return (error);
+
+		error = fget(td, capfd, &cap_no_rights, &capfp);
+		if (error != 0)
+			return (error);
+
+		acl = cacl_acl_for_file(capfp, 1, NULL);
+		if (acl == NULL) {
+			fdrop(capfp, td);
+			return (EOPNOTSUPP);
+		}
+
+		sx_xlock(&acl->al_lock);
+		error = cacl_acl_add(acl, token, CACL_ENTRY_AUTO_CLEANUP);
+		sx_xunlock(&acl->al_lock);
+
+		fdrop(capfp, td);
+
+		if (error != 0)
+			break;
+	}
+
+	if (error == 0)
+		SDT_PROBE1(cacl, , , acl__modify, "add_self_auto");
 	return (error);
 }
 
@@ -1359,6 +1642,9 @@ cacl_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 	case CACL_IOC_ADD_SELF:
 		return (cacl_ioctl_add_self(td, (struct cacl_fds *)data));
 
+	case CACL_IOC_ADD_SELF_AUTO:
+		return (cacl_ioctl_add_self_auto(td, (struct cacl_fds *)data));
+
 	case CACL_IOC_REMOVE:
 		return (cacl_ioctl_remove(td, (struct cacl_members *)data));
 
@@ -1390,6 +1676,7 @@ static void
 cacl_init(struct mac_policy_conf *mpc __unused)
 {
 
+	cacl_token_ref_init();
 	cacl_dev = make_dev(&cacl_cdevsw, 0, UID_ROOT, GID_WHEEL,
 	    0666, "cacl");
 	printf("cacl: loaded\n");
@@ -1398,9 +1685,23 @@ cacl_init(struct mac_policy_conf *mpc __unused)
 static void
 cacl_destroy(struct mac_policy_conf *mpc __unused)
 {
+	struct cacl_token_ref *tr, *tr_tmp;
+	int i;
 
 	if (cacl_dev != NULL)
 		destroy_dev(cacl_dev);
+
+	/* Clean up token reference hash table. */
+	mtx_lock(&cacl_token_mtx);
+	for (i = 0; i < CACL_TOKEN_HASH_SIZE; i++) {
+		LIST_FOREACH_SAFE(tr, &cacl_token_hash[i], tr_link, tr_tmp) {
+			LIST_REMOVE(tr, tr_link);
+			free(tr, M_CACL);
+		}
+	}
+	mtx_unlock(&cacl_token_mtx);
+	mtx_destroy(&cacl_token_mtx);
+
 	printf("cacl: unloaded\n");
 }
 
@@ -1459,6 +1760,7 @@ static struct mac_policy_ops cacl_ops = {
 	.mpo_vnode_check_write = cacl_vnode_check_write,
 	.mpo_vnode_check_stat = cacl_vnode_check_stat,
 	.mpo_vnode_check_mmap = cacl_vnode_check_mmap,
+	/* Note: No mpo_vnode_check_ioctl exists in MACF - use Capsicum */
 };
 
 MAC_POLICY_SET(&cacl_ops, cacl, "Capability Access Control List",

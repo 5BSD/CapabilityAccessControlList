@@ -84,6 +84,10 @@ test_vnode_devnull(void)
 	ret = read(dev_fd, buf, 1);
 	ASSERT_EQ(ret, 0, "read from /dev/null unexpected result");
 
+	/* IMPORTANT: Clear ACL before closing - vnodes are cached! */
+	ret = cacl_clear(cacl_fd, &dev_fd, 1);
+	ASSERT_EQ(ret, 0, "cacl_clear failed on /dev/null");
+
 	close(dev_fd);
 	close(cacl_fd);
 
@@ -113,6 +117,10 @@ test_vnode_devzero(void)
 	ret = read(dev_fd, buf, 4);
 	ASSERT_EQ(ret, 4, "read from /dev/zero failed after add_self");
 	ASSERT_EQ(buf[0], 0, "/dev/zero should return zeros");
+
+	/* IMPORTANT: Clear ACL before closing - vnodes are cached! */
+	ret = cacl_clear(cacl_fd, &dev_fd, 1);
+	ASSERT_EQ(ret, 0, "cacl_clear failed on /dev/zero");
 
 	close(dev_fd);
 	close(cacl_fd);

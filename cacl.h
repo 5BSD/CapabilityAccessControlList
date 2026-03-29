@@ -62,6 +62,12 @@ struct cacl_query {
 /* Add calling process to access lists. Creates list if needed. */
 #define	CACL_IOC_ADD_SELF	_IOW('L', 2, struct cacl_fds)
 
+/*
+ * Add calling process to access lists with auto-cleanup.
+ * Entry is automatically removed when no process holds this token.
+ */
+#define	CACL_IOC_ADD_SELF_AUTO	_IOW('L', 7, struct cacl_fds)
+
 /* Remove processes (by proc descriptor) from access lists. */
 #define	CACL_IOC_REMOVE		_IOW('L', 3, struct cacl_members)
 

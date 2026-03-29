@@ -25,6 +25,7 @@ TESTS="
 	test_edge
 	test_comprehensive
 	test_lock_query
+	test_auto_cleanup
 "
 
 # Colors for output (use printf to interpret escapes)

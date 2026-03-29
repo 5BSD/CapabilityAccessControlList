@@ -10,12 +10,20 @@
 #include "test_common.h"
 #include <signal.h>
 
+/*
+ * Test removing a process from access list.
+ *
+ * 1. Create pipe, add child to ACL
+ * 2. Child writes successfully
+ * 3. Remove child from ACL
+ * 4. Child's second write fails with EACCES
+ */
 static int
 test_remove_denies_access(void)
 {
 	int cacl_fd, pipe_r, pipe_w;
-	int proc_fd;
-	pid_t pid;
+	int proc_fd1, proc_fd2;
+	pid_t pid1, pid2;
 	int ret, status;
 	int sync1[2], sync2[2];
 	char buf[8];
@@ -29,103 +37,94 @@ test_remove_denies_access(void)
 	ret = create_pipe(&pipe_r, &pipe_w);
 	ASSERT(ret == 0, "create_pipe failed");
 
-	/* Two sync pipes for handshaking. */
 	ret = pipe(sync1);
 	ASSERT(ret == 0, "sync1 pipe failed");
 	ret = pipe(sync2);
 	ASSERT(ret == 0, "sync2 pipe failed");
 
-	/* Fork a child using pdfork. */
-	pid = fork_child(&proc_fd);
-	ASSERT(pid >= 0, "pdfork failed");
+	/*
+	 * Use two separate children for before/after removal test.
+	 * Each child execs test_helper to get a unique token.
+	 */
 
-	if (pid == 0) {
-		/*
-		 * Child: exec immediately to get a new token.
-		 * Then wait for signals to try writes.
-		 */
+	/* Child 1: Will be in ACL, write should succeed. */
+	pid1 = pdfork(&proc_fd1, 0);
+	ASSERT(pid1 >= 0, "pdfork1 failed");
+	if (pid1 == 0) {
+		close(pipe_r);
+		close(sync1[1]);
+		close(sync2[0]);
+		close(sync2[1]);
+		if (dup2(pipe_w, 3) < 0)
+			_exit(10);
+		if (dup2(sync1[0], 4) < 0)
+			_exit(11);
+		close(pipe_w);
+		close(sync1[0]);
+		execl("./test_helper", "test_helper", "write", "3", "4",
+		    (char *)NULL);
+		_exit(12);
+	}
+	close(sync1[0]);
+
+	/* Child 2: Will be removed from ACL, write should fail. */
+	pid2 = pdfork(&proc_fd2, 0);
+	ASSERT(pid2 >= 0, "pdfork2 failed");
+	if (pid2 == 0) {
 		close(pipe_r);
 		close(sync1[1]);
 		close(sync2[1]);
-		signal(SIGPIPE, SIG_IGN);
-
-		/* Move fds to known positions, avoiding close if already there. */
-		if (pipe_w != 3) {
-			if (dup2(pipe_w, 3) < 0)
-				_exit(10);
-			close(pipe_w);
-		}
-		if (sync1[0] != 4) {
-			if (dup2(sync1[0], 4) < 0)
-				_exit(11);
-			close(sync1[0]);
-		}
-		if (sync2[0] != 5) {
-			if (dup2(sync2[0], 5) < 0)
-				_exit(12);
-			close(sync2[0]);
-		}
-
-		/*
-		 * Shell script:
-		 * 1. Signal ready (write to stdout which parent reads)
-		 * 2. Wait for first sync (read fd 4)
-		 * 3. Try write "first" - should succeed (we're in ACL)
-		 * 4. Wait for second sync (read fd 5)
-		 * 5. Try write "second" - should fail (we've been removed)
-		 */
-		execl("/bin/sh", "sh", "-c",
-		    "read x <&4; "
-		    "printf first >&3 2>/dev/null || exit 1; "
-		    "read x <&5; "
-		    "printf second >&3 2>/dev/null && exit 2; "
-		    "exit 0",
+		if (dup2(pipe_w, 3) < 0)
+			_exit(10);
+		if (dup2(sync2[0], 4) < 0)
+			_exit(11);
+		close(pipe_w);
+		close(sync2[0]);
+		execl("./test_helper", "test_helper", "write", "3", "4",
 		    (char *)NULL);
-		_exit(13);
+		_exit(12);
 	}
-
-	/* Parent. */
-	close(sync1[0]);
 	close(sync2[0]);
 
-	/* Give child time to exec and be ready. */
+	/* Give children time to exec. */
 	usleep(100000);
 
-	/* Add self to read end. */
-	ret = cacl_add_self(cacl_fd, &pipe_r, 1);
+	/* Add self to pipe ACL (needed to read - pipes share one ACL). */
+	ret = cacl_add_self(cacl_fd, &pipe_w, 1);
 	ASSERT_EQ(ret, 0, "cacl_add_self failed");
 
-	/* Add child to write end (child has new token from exec). */
-	ret = cacl_add(cacl_fd, &pipe_w, 1, &proc_fd, 1);
-	ASSERT_EQ(ret, 0, "cacl_add failed");
+	/* Add both children to ACL initially. */
+	ret = cacl_add(cacl_fd, &pipe_w, 1, &proc_fd1, 1);
+	ASSERT_EQ(ret, 0, "cacl_add child1 failed");
+	ret = cacl_add(cacl_fd, &pipe_w, 1, &proc_fd2, 1);
+	ASSERT_EQ(ret, 0, "cacl_add child2 failed");
 
-	/* Signal child to do first write. */
-	write(sync1[1], "g", 1);
-	close(sync1[1]);
-
-	/* Read and verify first write. */
-	usleep(50000);
-	ret = read(pipe_r, buf, 5);
-	ASSERT_EQ(ret, 5, "first read failed");
-	buf[5] = '\0';
-	ASSERT(strcmp(buf, "first") == 0, "wrong data on first read");
-
-	/* Remove child from access list. */
-	ret = cacl_remove(cacl_fd, &pipe_w, 1, &proc_fd, 1);
+	/* Remove child2 from ACL. */
+	ret = cacl_remove(cacl_fd, &pipe_w, 1, &proc_fd2, 1);
 	ASSERT_EQ(ret, 0, "cacl_remove failed");
 
-	/* Signal child to try second write (should fail). */
+	/* Signal both children to try their writes. */
+	write(sync1[1], "g", 1);
 	write(sync2[1], "g", 1);
+	close(sync1[1]);
 	close(sync2[1]);
 
-	/* Wait for child. */
-	ret = waitpid(pid, &status, 0);
-	ASSERT(ret == pid, "waitpid failed");
-	ASSERT(WIFEXITED(status), "child did not exit normally");
-	ASSERT_EQ(WEXITSTATUS(status), 0,
-	    "child access not denied after removal");
+	/* Child1 should succeed (exit 1 = write worked). */
+	waitpid(pid1, &status, 0);
+	ASSERT(WIFEXITED(status), "child1 didn't exit normally");
+	ASSERT_EQ(WEXITSTATUS(status), 1, "child1 write should succeed");
 
-	close(proc_fd);
+	/* Child2 should fail (exit 0 = EACCES). */
+	waitpid(pid2, &status, 0);
+	ASSERT(WIFEXITED(status), "child2 didn't exit normally");
+	ASSERT_EQ(WEXITSTATUS(status), 0, "child2 should get EACCES after removal");
+
+	/* Verify we got data from child1. */
+	ret = read(pipe_r, buf, 1);
+	ASSERT_EQ(ret, 1, "should have received data from child1");
+
+	close(proc_fd1);
+	close(proc_fd2);
 	close(pipe_r);
 	close(pipe_w);
 	close(cacl_fd);

@@ -16,7 +16,8 @@ TESTS=	test_add_self \
 	test_threads \
 	test_edge \
 	test_comprehensive \
-	test_lock_query
+	test_lock_query \
+	test_auto_cleanup
 
 HELPERS= test_helper
 
@@ -83,6 +84,9 @@ test_comprehensive: test_comprehensive.c test_common.h ../cacl.h
 
 test_lock_query: test_lock_query.c test_common.h ../cacl.h
 	$(CC) $(CFLAGS) -o $@ test_lock_query.c $(LDFLAGS)
+
+test_auto_cleanup: test_auto_cleanup.c test_common.h ../cacl.h
+	$(CC) $(CFLAGS) -o $@ test_auto_cleanup.c $(LDFLAGS)
 
 test_helper: test_helper.c
 	$(CC) $(CFLAGS) -o $@ test_helper.c $(LDFLAGS)
